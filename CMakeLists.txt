@@ -19,7 +19,7 @@ endif()
 project(peer)
 
 option(ENABLE_TESTS "Enable tests" OFF)
-option(BUILD_SHARED_LIBS "Build shared libraries" ON)
+option(BUILD_SHARED_LIBS "Build shared libraries" OFF)
 option(ADDRESS_SANITIZER "Build with AddressSanitizer." OFF)
 option(MEMORY_SANITIZER "Build with MemorySanitizer." OFF)
 option(THREAD_SANITIZER "Build with ThreadSanitizer." OFF)
@@ -72,6 +72,7 @@ ExternalProject_Add(cjson
   SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/cJSON
   CMAKE_ARGS
     -DCMAKE_C_FLAGS="-fPIC"
+    -DCMAKE_POLICY_VERSION_MINIMUM=3.5
     -DBUILD_SHARED_LIBS=off
     -DENABLE_CJSON_TEST=off
     -DCMAKE_INSTALL_PREFIX=${CMAKE_BINARY_DIR}/dist
@@ -81,7 +82,8 @@ ExternalProject_Add(cjson
 ExternalProject_Add(mbedtls
   SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/mbedtls
   CMAKE_ARGS
-    -DCMAKE_C_FLAGS="-fPIC"
+    -DCMAKE_C_FLAGS=-fPIC
+    -DMBEDTLS_FATAL_WARNINGS=off
     -DENABLE_TESTING=off
     -DENABLE_PROGRAMS=off
     -DCMAKE_INSTALL_PREFIX=${CMAKE_BINARY_DIR}/dist
@@ -104,7 +106,20 @@ ExternalProject_Add(usrsctp
   SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/usrsctp
   CMAKE_ARGS
     -DCMAKE_C_FLAGS="-fPIC"
+    -DCMAKE_POLICY_VERSION_MINIMUM=3.5
     -Dsctp_build_programs=off
     -DCMAKE_INSTALL_PREFIX=${CMAKE_BINARY_DIR}/dist
     -DCMAKE_TOOLCHAIN_FILE=${CMAKE_TOOLCHAIN_FILE}
+)
+
+# FAT library target (combines all static libraries into one)
+set(FAT_LIB_NAME "libpeer_fat.a")
+set(FAT_LIB_PATH "${CMAKE_BINARY_DIR}/dist/lib/${FAT_LIB_NAME}")
+
+add_custom_target(fat_library
+  COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/scripts/create_fat_library.sh
+    ${CMAKE_BINARY_DIR}
+    ${FAT_LIB_PATH}
+  DEPENDS peer
+  COMMENT "Creating FAT library: ${FAT_LIB_NAME}"
 )

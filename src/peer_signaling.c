@@ -13,6 +13,7 @@
 #include "peer_signaling.h"
 #include "ports.h"
 #include "ssl_transport.h"
+#include "tcp_transport.h"
 #include "utils.h"
 
 #define KEEP_ALIVE_TIMEOUT_SECONDS 60
@@ -52,7 +53,8 @@ typedef struct PeerSignaling {
   uint16_t packet_id;
   int id;
 
-  int proto;  // 0: MQTT, 1: HTTP
+  int proto;    // 0: MQTT, 1: HTTP
+  int use_tls;  // 0: plain, 1: TLS
   int port;
   char host[HOST_MAX_LEN];
   char path[PATH_MAX_LEN];
@@ -86,9 +88,11 @@ static int peer_signaling_resolve_token(const char* token, char* username, char*
   return 0;
 }
 
-static int peer_signaling_resolve_url(const char* url, char* host, int* port, char* path) {
+static int peer_signaling_resolve_url(const char* url, char* host, int* port, char* path, int* use_tls) {
   char *port_start, *path_start;
   int proto = 0;
+
+  *use_tls = 1;  // default to TLS
 
   if (url == NULL || strlen(url) == 0) {
     LOGW("Invalid URL");
@@ -98,17 +102,21 @@ static int peer_signaling_resolve_url(const char* url, char* host, int* port, ch
   if (strncmp(url, "mqtts://", 8) == 0) {
     *port = 8883;
     url += 8;
+    *use_tls = 1;
   } else if (strncmp(url, "https://", 8) == 0) {
     *port = 443;
     url += 8;
     proto = 1;
+    *use_tls = 1;
   } else if (strncmp(url, "mqtt://", 7) == 0) {
     *port = 1883;
     url += 7;
+    *use_tls = 0;
   } else if (strncmp(url, "http://", 7) == 0) {
     *port = 80;
     url += 7;
     proto = 1;
+    *use_tls = 0;
   } else {
     LOGW("Invalid URL: %s", url);
     return -1;
@@ -131,7 +139,7 @@ static int peer_signaling_resolve_url(const char* url, char* host, int* port, ch
     strncpy(host, url, strlen(url));
   }
 
-  LOGI("Host: %s, Port: %d, Path: %s", host, *port, path);
+  LOGI("Host: %s, Port: %d, Path: %s, TLS: %d", host, *port, path, *use_tls);
   return proto;
 }
 
@@ -301,19 +309,28 @@ HTTPResponse_t peer_signaling_http_request(const TransportInterface_t* transport
   return response;
 }
 
-static int peer_signaling_http_post(const char* hostname, const char* path, int port, const char* auth, const char* body) {
+static int peer_signaling_http_post(const char* hostname, const char* path, int port, int use_tls, const char* auth, const char* body) {
   int ret = 0;
   TransportInterface_t trans_if = {0};
-  NetworkContext_t net_ctx;
+  NetworkContext_t ssl_net_ctx;
+  PlainNetworkContext_t tcp_net_ctx;
   HTTPResponse_t res;
-
-  trans_if.recv = ssl_transport_recv;
-  trans_if.send = ssl_transport_send;
-  trans_if.pNetworkContext = &net_ctx;
 
   assert(port > 0);
 
-  ret = ssl_transport_connect(&net_ctx, hostname, port, NULL);
+  if (use_tls) {
+    trans_if.recv = (TransportRecv_t)ssl_transport_recv;
+    trans_if.send = (TransportSend_t)ssl_transport_send;
+    trans_if.pNetworkContext = &ssl_net_ctx;
+
+    ret = ssl_transport_connect(&ssl_net_ctx, hostname, port, NULL);
+  } else {
+    trans_if.recv = (TransportRecv_t)tcp_transport_recv;
+    trans_if.send = (TransportSend_t)tcp_transport_send;
+    trans_if.pNetworkContext = &tcp_net_ctx;
+
+    ret = tcp_transport_connect(&tcp_net_ctx, hostname, port);
+  }
 
   if (ret < 0) {
     LOGE("Failed to connect to %s:%d", hostname, port);
@@ -323,7 +340,11 @@ static int peer_signaling_http_post(const char* hostname, const char* path, int 
   res = peer_signaling_http_request(&trans_if, "POST", 4, hostname, strlen(hostname), path,
                                     strlen(path), auth, strlen(auth), body, strlen(body));
 
-  ssl_transport_disconnect(&net_ctx);
+  if (use_tls) {
+    ssl_transport_disconnect(&ssl_net_ctx);
+  } else {
+    tcp_transport_disconnect(&tcp_net_ctx);
+  }
 
   if (res.pHeaders == NULL) {
     LOGE("Response headers are NULL");
@@ -490,9 +511,9 @@ static void peer_signaling_onicecandidate(char* description, void* userdata) {
       char cred[TOKEN_MAX_LEN + 10];
       memset(cred, 0, sizeof(cred));
       snprintf(cred, sizeof(cred), "Bearer %s", g_ps.token);
-      peer_signaling_http_post(g_ps.host, g_ps.path, g_ps.port, cred, description);
+      peer_signaling_http_post(g_ps.host, g_ps.path, g_ps.port, g_ps.use_tls, cred, description);
     } else {
-      peer_signaling_http_post(g_ps.host, g_ps.path, g_ps.port, "", description);
+      peer_signaling_http_post(g_ps.host, g_ps.path, g_ps.port, g_ps.use_tls, "", description);
     }
   }
 }
@@ -500,7 +521,7 @@ static void peer_signaling_onicecandidate(char* description, void* userdata) {
 int peer_signaling_connect(const char* url, const char* token, PeerConnection* pc) {
   char* client_id;
 
-  if ((g_ps.proto = peer_signaling_resolve_url(url, g_ps.host, &g_ps.port, g_ps.path)) < 0) {
+  if ((g_ps.proto = peer_signaling_resolve_url(url, g_ps.host, &g_ps.port, g_ps.path, &g_ps.use_tls)) < 0) {
     LOGE("Resolve URL failed");
   }
 

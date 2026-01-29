@@ -4,9 +4,12 @@
 #include <stdlib.h>
 #include <sys/time.h>
 #include <unistd.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 #include "peer.h"
-#include "reader.h"
 
 int g_interrupted = 0;
 PeerConnection* g_pc = NULL;
@@ -18,9 +21,11 @@ static void onconnectionstatechange(PeerConnectionState state, void* data) {
 }
 
 static void onopen(void* user_data) {
+  printf("on_open..\n");
 }
 
 static void onclose(void* user_data) {
+  printf("on_close..\n");
 }
 
 static void onmessage(char* msg, size_t len, void* user_data, uint16_t sid) {
@@ -86,11 +91,10 @@ void parse_arguments(int argc, char* argv[], const char** url, const char** toke
 }
 
 int main(int argc, char* argv[]) {
-  uint64_t curr_time, video_time, audio_time;
-  uint8_t* buf = NULL;
+  uint64_t curr_time, dcmsg_time = 0;
   const char* url = NULL;
   const char* token = NULL;
-  int size;
+  int count = 0;
 
   pthread_t peer_singaling_thread;
   pthread_t peer_connection_thread;
@@ -104,8 +108,8 @@ int main(int argc, char* argv[]) {
           {.urls = "stun:stun.l.google.com:19302"},
       },
       .datachannel = DATA_CHANNEL_STRING,
-      .video_codec = CODEC_H264,
-      .audio_codec = CODEC_PCMA};
+      .video_codec = CODEC_NONE,
+      .audio_codec = CODEC_NONE};
 
   printf("=========== Parsed Arguments ===========\n");
   printf(" %-5s : %s\n", "URL", url);
@@ -122,29 +126,16 @@ int main(int argc, char* argv[]) {
   pthread_create(&peer_connection_thread, NULL, peer_connection_task, NULL);
   pthread_create(&peer_singaling_thread, NULL, peer_singaling_task, NULL);
 
-  reader_init();
-
   while (!g_interrupted) {
     if (g_state == PEER_CONNECTION_COMPLETED) {
       curr_time = get_timestamp();
 
-      // FPS 25
-      if (curr_time - video_time > 40) {
-        video_time = curr_time;
-        if ((buf = reader_get_video_frame(&size)) != NULL) {
-          peer_connection_send_video(g_pc, buf, size);
-          // need to free the buffer
-          free(buf);
-          buf = NULL;
-        }
-      }
-
-      if (curr_time - audio_time > 20) {
-        if ((buf = reader_get_audio_frame(&size)) != NULL) {
-          peer_connection_send_audio(g_pc, buf, size);
-          buf = NULL;
-        }
-        audio_time = curr_time;
+      // Message on Datachannel
+      if ((curr_time - dcmsg_time) > 1000) {
+        dcmsg_time = curr_time;
+        char msg[256] = { 0x00, };
+        snprintf(msg, sizeof(msg) - 1, "datachannel message : %05d", count++);
+        peer_connection_datachannel_send(g_pc, msg, strlen(msg));
       }
     }
     usleep(1000);
@@ -152,8 +143,6 @@ int main(int argc, char* argv[]) {
 
   pthread_join(peer_singaling_thread, NULL);
   pthread_join(peer_connection_thread, NULL);
-
-  reader_deinit();
 
   peer_signaling_disconnect();
   peer_connection_destroy(g_pc);
