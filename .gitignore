@@ -1,1 +1,14 @@
-build
+# Build work directories (not the final artifacts)
+build/
+_build/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+._*

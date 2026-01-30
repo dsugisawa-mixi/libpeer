@@ -1,0 +1,26 @@
+{
+  "name": "jp.co.mixi.libpeer",
+  "version": "0.1.0",
+  "displayName": "LibPeer Native Plugin",
+  "unity": "2021.3",
+  "unityRelease": "0f1",
+  "description": "libpeer native bindings for Unity - A lightweight WebRTC library for DataChannel and media streaming.",
+  "keywords": [
+    "webrtc",
+    "datachannel",
+    "p2p",
+    "networking",
+    "native"
+  ],
+  "author": {
+    "name": "MIXI, Inc.",
+    "url": "https://mixi.co.jp"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/dsugisawa-mixi/libpeer.git",
+    "directory": "upm/jp.co.mixi.libpeer"
+  },
+  "samples": []
+}
