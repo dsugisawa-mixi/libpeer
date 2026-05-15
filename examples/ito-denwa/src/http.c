@@ -1,8 +1,16 @@
 #include "http.h"
+#include "common.h"
+#include "wifi.h"    // g_api_ip
+#include "gui.h"     // g_lab_state, g_lab_ids, g_timeline_status_ver, ...
+#include "tts.h"     // tts_start_playback, tts_send_end_if_needed
+#include "queue.h"   // tts_queue_push, tts_queue_pop
+#include "ic_ring.h" // ic_send, IC_MSG_*
+#include "cJSON.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <inttypes.h>
 
 #include "pico/stdlib.h"
 #include "lwip/altcp.h"
@@ -103,6 +111,199 @@ const char *http_find_header(const char *resp, size_t len, const char *name) {
     return NULL;
 }
 
+int http_kick_info(const char *device_id) {
+    g_https_mode = HM_INFO;
+    char hdr[128];
+    snprintf(hdr, sizeof(hdr), "X-Device-Id: %s\r\n", device_id);
+    if (http_build_request("GET", "/api/tunnel/info", hdr,
+                            NULL, NULL, 0) != 0) return -1;
+    return http_request_start(&g_api_ip, g_https_host);
+}
+
+int http_kick_timeline(const char *device_id, const char *operator_id,
+                       int64_t last_publish_id) {
+    g_https_mode = HM_TIMELINE;
+    char path[256];
+    int64_t start_id = last_publish_id > 0 ? last_publish_id : 0;
+    int n = snprintf(path, sizeof(path),
+                     "/api/qa/timeline?publish=1&operator_id=%s"
+                     "&start=%lld&end=-1&limit=1",
+                     operator_id, (long long)start_id);
+    if (n < 0 || (size_t)n >= sizeof(path)) {
+        printf("[timeline] path overflow\n");
+        return -1;
+    }
+    char hdr[128];
+    snprintf(hdr, sizeof(hdr), "X-Device-Id: %s\r\n", device_id);
+    if (http_build_request("GET", path, hdr, NULL, NULL, 0) != 0) return -1;
+    return http_request_start(&g_api_ip, g_https_host);
+}
+
+//=============================================================================
+// Response JSON parsing (static — called from https_handle_done)
+//=============================================================================
+int64_t g_last_publish_id = -1;
+
+static int parse_lab_response(const char *body) {
+    cJSON *root = cJSON_Parse(body);
+    if (!root) {
+        printf("[json] parse failed (body head: %.60s)\n", body);
+        return -1;
+    }
+    cJSON *operators = cJSON_GetObjectItem(root, "operators");
+    if (!cJSON_IsArray(operators)) {
+        printf("[json] no 'operators' array\n");
+        cJSON_Delete(root);
+        return -1;
+    }
+    int count = 0;
+    cJSON *op;
+    cJSON_ArrayForEach(op, operators) {
+        if (count >= MAX_LABS) break;
+        cJSON *op_id = cJSON_GetObjectItem(op, "id");
+        if (!cJSON_IsString(op_id) || !op_id->valuestring) continue;
+        cJSON *lab = cJSON_GetObjectItem(op, "lab");
+        if (!cJSON_IsObject(lab)) continue;
+        cJSON *lab_id = cJSON_GetObjectItem(lab, "lab_id");
+        if (!cJSON_IsString(lab_id) || !lab_id->valuestring) continue;
+        strncpy(g_operator_ids[count], op_id->valuestring,  MAX_LAB_ID_LEN - 1);
+        g_operator_ids[count][MAX_LAB_ID_LEN - 1] = '\0';
+        strncpy(g_lab_ids[count],      lab_id->valuestring, MAX_LAB_ID_LEN - 1);
+        g_lab_ids[count][MAX_LAB_ID_LEN - 1] = '\0';
+        count++;
+    }
+    cJSON_Delete(root);
+    g_lab_count    = count;
+    g_lab_selected = 0;
+    printf("[json] extracted %d operator/lab pair(s)\n", count);
+    for (int i = 0; i < count; i++) {
+        printf("        [%d] op=%s lab=%s\n", i, g_operator_ids[i], g_lab_ids[i]);
+    }
+    return 0;
+}
+
+static int parse_timeline_response(const char *body) {
+    cJSON *root = cJSON_Parse(body);
+    if (!root) {
+        printf("[timeline] parse failed (body head: %.60s)\n", body);
+        return -1;
+    }
+    cJSON *items = cJSON_GetObjectItem(root, "items");
+    if (!cJSON_IsArray(items)) {
+        cJSON_Delete(root);
+        printf("[timeline] no 'items' array\n");
+        return -1;
+    }
+
+    int new_count = 0;
+    int64_t max_seen = g_last_publish_id;
+    cJSON *it;
+    cJSON_ArrayForEach(it, items) {
+        cJSON *pid = cJSON_GetObjectItem(it, "publish_id");
+        cJSON *msg = cJSON_GetObjectItem(it, "message");
+        if (!cJSON_IsNumber(pid) || !cJSON_IsString(msg) || !msg->valuestring) continue;
+        int64_t this_pid = (int64_t)pid->valuedouble;
+        if (this_pid <= g_last_publish_id) continue;
+        if (tts_queue_push(msg->valuestring)) new_count++;
+        if (this_pid > max_seen) max_seen = this_pid;
+    }
+    if (max_seen > g_last_publish_id) g_last_publish_id = max_seen;
+    cJSON_Delete(root);
+    printf("[timeline] poll done: %d new item(s), last_publish_id=%lld\n",
+           new_count, (long long)g_last_publish_id);
+    g_timeline_status_ver++;
+    return 0;
+}
+
+//=============================================================================
+// HTTPS response completion handler
+//=============================================================================
+void https_handle_done(void) {
+    bool ok = (g_https_state == HC_DONE_OK);
+    printf("[https] done %s (mode=%d, %u bytes)\n",
+           ok ? "OK" : "ERR", (int)g_https_mode, (unsigned)g_https_resp_len);
+
+    if (ok && !g_https_headers_done) {
+        const char *body = http_find_body(g_https_resp, g_https_resp_len);
+        if (body) {
+            g_https_body_start   = (size_t)(body - g_https_resp);
+            g_https_headers_done = true;
+        }
+    }
+
+    switch (g_https_mode) {
+    case HM_INFO:
+        if (ok && g_https_headers_done) {
+            const char *body = g_https_resp + g_https_body_start;
+            g_lab_state = (parse_lab_response(body) == 0) ? LAB_OK : LAB_ERR;
+        } else {
+            g_lab_state = LAB_ERR;
+        }
+        mem_barrier();
+        ic_send(IC_MSG_LABS_READY, NULL, 0);
+        break;
+
+    case HM_TIMELINE:
+        if (ok && g_https_headers_done) {
+            const char *body = g_https_resp + g_https_body_start;
+            parse_timeline_response(body);
+        } else {
+            printf("[timeline] poll failed\n");
+        }
+        break;
+
+    case HM_TTS:
+        if (!ok || !g_https_headers_done) {
+            printf("[tts] request failed — drop one queue entry\n");
+            if (g_tts_play_active) {
+                tts_send_end_if_needed();
+            } else {
+                tts_queue_pop();
+            }
+        } else if (!g_tts_play_active) {
+            http_apply_tts_headers();
+            tts_start_playback();
+        }
+        break;
+    }
+
+    http_cleanup();
+    http_set_state(HC_IDLE);
+    mem_barrier();
+}
+
+void http_apply_tts_headers(void) {
+    const char *sr = http_find_header(g_https_resp, g_https_body_start, "X-Sample-Rate");
+    uint32_t hz = 24000;
+    if (sr) {
+        int v = atoi(sr);
+        if (v >= 8000 && v <= 96000) hz = (uint32_t)v;
+    }
+    g_tts_sample_rate = hz;
+    const char *te = http_find_header(g_https_resp, g_https_body_start, "Transfer-Encoding");
+    g_https_chunked = (te && strncasecmp(te, "chunked", 7) == 0);
+    printf("[tts] sample_rate=%u chunked=%d\n", (unsigned)hz, (int)g_https_chunked);
+}
+
+void http_resp_compact_locked(void) {
+    if (g_tts_play_pos == 0) return;
+    size_t shift    = g_tts_play_pos;
+    size_t body_len = g_https_resp_len - g_https_body_start;
+    if (shift > body_len) shift = body_len;
+    size_t keep     = body_len - shift;
+    if (keep > 0) {
+        memmove(g_https_resp + g_https_body_start,
+                g_https_resp + g_https_body_start + shift,
+                keep);
+    }
+    if (g_https_chunked) {
+        g_chunked_write_pos -= shift;
+        g_chunked_read_pos  -= shift;
+    }
+    g_https_resp_len -= shift;
+    g_tts_play_pos    = 0;
+}
+
 //=============================================================================
 // recv-side completion check
 //=============================================================================
@@ -131,11 +332,12 @@ static void http_check_complete(void) {
         } else {
             printf("[https] no Content-Length (chunked?), will rely on FIN/timeout\n");
         }
-        // True streaming for TTS: as soon as headers are parsed, hand off to
-        // the application so it can configure the audio engine. core1's
-        // tts_forward_pump will then ship decoded PCM to core0 chunk-by-chunk.
+        // True streaming for TTS: parse X-Sample-Rate / Transfer-Encoding,
+        // then hand off to the application so it can arm the audio engine.
+        // core1's tts_forward_pump will then ship decoded PCM chunk-by-chunk.
         if (g_https_mode == HM_TTS) {
-            http_on_tts_headers_done();
+            http_apply_tts_headers();
+            tts_start_playback();
         }
     }
     if (g_https_headers_done && g_https_content_len >= 0) {
@@ -186,7 +388,7 @@ static err_t https_recv_cb(void *arg, struct altcp_pcb *pcb, struct pbuf *p, err
     // reclaim already-consumed body bytes (we're already holding the
     // async_context lock, so the hook must not re-acquire it).
     if (g_https_resp_len + need >= sizeof(g_https_resp)) {
-        http_on_recv_overflow();
+        http_resp_compact_locked();
     }
     // Still no room → return ERR_MEM so lwIP keeps the pbuf and re-delivers
     // it later. This is real TCP backpressure: the server's send window stays

@@ -6,14 +6,8 @@
 // pumping) live in main.c and reach into the response via the extern globals
 // declared below.
 //
-// Two callback hooks let the transport notify the application without
-// pulling app code into http.c:
-//   - http_on_tts_headers_done(): fired once per HM_TTS request the moment
-//     response headers parse, so the audio engine can be armed before the
-//     body finishes streaming.
-//   - http_on_recv_overflow(): fired from inside the lwIP recv callback when
-//     accepting the next pbuf would overflow g_https_resp; the implementer
-//     should compact already-consumed body bytes and slide the rest down.
+// Application hook: tts_start_playback() is implemented by main.c and called
+// directly from http_check_complete after headers parse in HM_TTS mode.
 #pragma once
 
 #include <stdbool.h>
@@ -75,6 +69,7 @@ extern volatile size_t        g_https_body_start;
 extern volatile int           g_https_content_len;   // -1 = unknown
 extern volatile uint32_t      g_tts_sample_rate;     // parsed from X-Sample-Rate
 
+extern volatile size_t g_tts_play_pos;       // bytes forwarded via FIFO (core1)
 extern bool          g_https_chunked;
 extern size_t        g_chunked_read_pos;     // offset (from body_start) into raw chunked stream
 extern size_t        g_chunked_write_pos;    // offset where decoded PCM bytes have been written
@@ -119,14 +114,31 @@ const char *http_find_body(const char *resp, size_t len);
 // and any leading whitespace) or NULL if not found.
 const char *http_find_header(const char *resp, size_t len, const char *name);
 
-// === Application hooks (implemented by main.c) ============================
-// Called once when response headers are parsed in HM_TTS mode. The
-// implementer reads X-Sample-Rate / Transfer-Encoding from the response and
-// arms the audio engine so playback can start before the body finishes.
-void http_on_tts_headers_done(void);
+// Pull X-Sample-Rate and Transfer-Encoding from the response headers into
+// g_tts_sample_rate / g_https_chunked. Called automatically from
+// http_check_complete for HM_TTS; also available for the FIN fallback path.
+// Kick off a GET /api/tunnel/info request.
+int http_kick_info(const char *device_id);
 
-// Called from inside the lwIP recv callback when accepting the next pbuf
-// would overflow g_https_resp. The implementer should compact already-
-// consumed body bytes (e.g. forward the lwIP/async_context lock is already
-// held — do NOT take it again).
-void http_on_recv_overflow(void);
+// Kick off a GET /api/qa/timeline request.
+int http_kick_timeline(const char *device_id, const char *operator_id,
+                       int64_t last_publish_id);
+
+// Timeline last-seen publish ID (owned by http.c, used by main.c for
+// kick_timeline and status display).
+extern int64_t g_last_publish_id;
+
+void http_apply_tts_headers(void);
+
+// Handle HTTPS response completion: parse body, dispatch by mode,
+// then cleanup + set state to IDLE.
+void https_handle_done(void);
+
+// Compact already-consumed body bytes from g_https_resp, rebasing offsets.
+// Caller must hold the lwIP/async_context lock (recv_cb path does).
+void http_resp_compact_locked(void);
+
+// === Application hooks (implemented by main.c) ============================
+// Arm audio streaming playback. Called from http_check_complete after
+// http_apply_tts_headers() when HM_TTS headers are parsed.
+void tts_start_playback(void);

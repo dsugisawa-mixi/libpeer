@@ -76,6 +76,10 @@ ADD_EXECUTABLE(
     ${CMAKE_CURRENT_LIST_DIR}/../src/ic_ring.c
     ${CMAKE_CURRENT_LIST_DIR}/../src/http.c
     ${CMAKE_CURRENT_LIST_DIR}/../src/queue.c
+    ${CMAKE_CURRENT_LIST_DIR}/../src/led.c
+    ${CMAKE_CURRENT_LIST_DIR}/../src/wifi.c
+    ${CMAKE_CURRENT_LIST_DIR}/../src/gui.c
+    ${CMAKE_CURRENT_LIST_DIR}/../src/tts.c
     ${CMAKE_CURRENT_LIST_DIR}/../main.c
 )
 
