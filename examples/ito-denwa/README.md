@@ -85,22 +85,34 @@ The output `.uf2` file can be flashed to the Pico 2 W via USB mass-storage mode.
 
 ```
 examples/ito-denwa/
-├── main.c                  # Application entry, dual-core state machines,
-│                           #   HTTPS client, timeline polling, TTS queue
+├── main.c                  # Application entry, dual-core state machines
 ├── cmake.rp2350/
 │   ├── CMakeLists.txt      # Build configuration for RP2350
 │   └── pico_sdk_import.cmake
 ├── inc/
 │   ├── audio.h             # I2S audio playback API
+│   ├── common.h            # Shared utility macros and inline functions
+│   ├── gui.h               # LCD GUI, status logging, button handling
+│   ├── http.h              # HTTPS client, connection state machine
 │   ├── ic_ring.h           # Inter-core SPSC ring buffer
-│   ├── st7789.h            # LCD driver API
+│   ├── led.h               # Non-blocking LED blink state machine
 │   ├── lwipopts.h          # lwIP stack configuration
-│   └── mbedtls_config.h    # mbedTLS configuration
+│   ├── mbedtls_config.h    # mbedTLS configuration
+│   ├── queue.h             # TTS message FIFO ring (SPSC)
+│   ├── st7789.h            # LCD driver API
+│   ├── tts.h               # TTS streaming pipeline
+│   └── wifi.h              # WiFi initialization and DNS resolution
 └── src/
     ├── audio.c             # PIO I2S + DMA audio engine
+    ├── gui.c               # LCD display UI and view management
+    ├── http.c              # HTTPS communication and response handling
     ├── i2s.pio             # PIO program for I2S output
     ├── ic_ring.c           # Inter-core message bus implementation
-    └── st7789.c            # ST7789 SPI LCD driver
+    ├── led.c               # LED blink state machine
+    ├── queue.c             # Thread-safe circular TTS message queue
+    ├── st7789.c            # ST7789 SPI LCD driver
+    ├── tts.c               # TTS playback and PCM stream handling
+    └── wifi.c              # WiFi connectivity setup
 ```
 
 ## Dependencies
