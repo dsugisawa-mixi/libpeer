@@ -16,16 +16,13 @@
 #include "lwip/dns.h"
 #include "lwip/ip_addr.h"
 #include "lwip/netif.h"
-#include "lwip/pbuf.h"
-#include "lwip/altcp.h"
-#include "lwip/altcp_tls.h"
-#include "mbedtls/ssl.h"
-#include "mbedtls/debug.h"
 
 #include "cJSON.h"
 #include "st7789.h"
 #include "audio.h"
 #include "ic_ring.h"
+#include "http.h"
+#include "queue.h"
 
 //-----------------------------------------------------------------------------
 // Button IDs (used as indices into g_buttons[])
@@ -66,18 +63,8 @@ typedef enum {
 #define TIMELINE_PATH_FMT "/api/qa/timeline?publish=1&operator_id=%s&start=%lld&end=-1&limit=1"
 #define TTS_PATH        "/api/tts/generate_stream"
 #define TIMELINE_POLL_INTERVAL_MS 10000
-#define HTTPS_PORT      443
 #define MAX_LABS        16
 #define MAX_LAB_ID_LEN  64
-// Response body holds either /api/tunnel/info (~70KB JSON) or one TTS reply
-// (raw PCM, ~48 KB/s @ 24kHz mono16 → up to ~3.3s of audio at 160 KB).
-#define RESP_BUF_SIZE   (160 * 1024)
-// Big enough for HTTP POST headers + a few KB of UTF-8 message body.
-#define REQ_BUF_SIZE    4096
-
-// TTS queue (FIFO of pending messages waiting to be POSTed to /api/tts/...)
-#define TTS_QUEUE_SIZE  8
-#define TTS_MSG_LEN     512
 
 static inline uint32_t board_millis(void) {
     return to_ms_since_boot(get_absolute_time());
@@ -89,7 +76,6 @@ static inline void mem_barrier(void) {
 
 // Forward decls — defined later but called from earlier functions.
 static void set_status(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
-static void https_check_complete(void);
 static void tts_apply_response_headers(void);
 static void tts_start_playback(void);
 static void resp_compact_locked(void);
@@ -356,11 +342,6 @@ static volatile int  g_timeline_status_ver = 0;     // bumped on poll events for
 // core read of g_timeline_active.
 static bool          g_core1_tl_active    = false;
 
-// FIFO ring of pending TTS messages (utf-8 text)
-static char     g_tts_queue[TTS_QUEUE_SIZE][TTS_MSG_LEN];
-static volatile int g_tts_head = 0;   // read (next to dequeue)
-static volatile int g_tts_tail = 0;   // write (next free slot)
-
 // TTS playback streaming state.
 // core1 owns the network/decoder side; it advances g_tts_play_pos as bytes
 // are forwarded to core0 via IC_MSG_TTS_PCM_CHUNK. core0 owns the audio
@@ -392,374 +373,9 @@ static volatile size_t   g_core0_pcm_pending_len = 0;
 // once both pending and pad are drained.
 static volatile bool     g_core0_tts_stream_done = false;
 
-static int tts_queue_count(void) {
-    return (g_tts_tail - g_tts_head + TTS_QUEUE_SIZE * 2) % TTS_QUEUE_SIZE;
-}
-
-// Returns true if the message was queued, false if dropped (queue full or empty).
-static bool tts_queue_push(const char *msg) {
-    if (!msg || !*msg) return false;
-    int next = (g_tts_tail + 1) % TTS_QUEUE_SIZE;
-    if (next == g_tts_head) {
-        printf("[tts] queue full, dropping: %.40s\n", msg);
-        return false;
-    }
-    strncpy(g_tts_queue[g_tts_tail], msg, TTS_MSG_LEN - 1);
-    g_tts_queue[g_tts_tail][TTS_MSG_LEN - 1] = '\0';
-    mem_barrier();
-    g_tts_tail = next;
-    printf("[tts] queued (#%d): %.60s\n", tts_queue_count(), msg);
-    return true;
-}
-
-static const char *tts_queue_peek(void) {
-    if (g_tts_head == g_tts_tail) return NULL;
-    return g_tts_queue[g_tts_head];
-}
-
-static void tts_queue_pop(void) {
-    if (g_tts_head == g_tts_tail) return;
-    g_tts_head = (g_tts_head + 1) % TTS_QUEUE_SIZE;
-}
-
 //=============================================================================
-// HTTPS client (altcp_tls)
+// HTTPS client (altcp_tls) — see http.h / src/http.c
 //=============================================================================
-typedef enum {
-    HC_IDLE,
-    HC_CONNECTING,
-    HC_REQUESTING,
-    HC_DONE_OK,
-    HC_DONE_ERR,
-} https_state_t;
-
-// What kind of request is currently in flight (or just finished).
-typedef enum {
-    HM_INFO,      // GET /api/tunnel/info  → lab list
-    HM_TIMELINE,  // GET /api/qa/timeline?...  → JSON
-    HM_TTS,       // POST /api/tts/generate_stream  → raw PCM body
-} https_mode_t;
-
-static volatile https_state_t g_https_state = HC_IDLE;
-static volatile https_mode_t  g_https_mode  = HM_INFO;
-static struct altcp_pcb       *g_https_pcb  = NULL;
-static struct altcp_tls_config *g_tls_cfg   = NULL;
-static char  g_https_host[128];
-static char  g_https_req[REQ_BUF_SIZE];
-static size_t g_https_req_len = 0;
-static char  g_https_resp[RESP_BUF_SIZE];
-static volatile size_t g_https_resp_len = 0;
-static uint32_t g_https_state_at = 0;
-static volatile bool   g_https_headers_done = false;
-static volatile size_t g_https_body_start   = 0;
-static volatile int    g_https_content_len  = -1;  // -1 = unknown
-static volatile uint32_t g_tts_sample_rate  = 24000;  // parsed from X-Sample-Rate
-
-// Chunked transfer-encoding decoder (used when server returns
-// Transfer-Encoding: chunked, which uvicorn's StreamingResponse does).
-// Decoded body bytes are compacted in-place inside g_https_resp[body_start...]
-// so the downstream PCM pump can treat g_chunked_write_pos as the "decoded
-// body length" without caring about framing.
-typedef enum {
-    CHUNK_NEED_SIZE,     // accumulating hex digits of chunk size
-    CHUNK_SIZE_SAW_CR,   // got \r, expecting \n
-    CHUNK_DATA,          // copying chunk data bytes
-    CHUNK_DATA_SAW_CR,   // got \r after data, expecting \n
-    CHUNK_DONE,          // 0-size chunk seen → stream finished
-} chunk_state_t;
-
-static bool          g_https_chunked      = false;
-static size_t        g_chunked_read_pos   = 0;   // offset (from body_start) into raw chunked stream
-static size_t        g_chunked_write_pos  = 0;   // offset where decoded PCM bytes have been written
-static chunk_state_t g_chunked_state      = CHUNK_NEED_SIZE;
-static uint32_t      g_chunked_size_acc   = 0;
-static uint32_t      g_chunked_remaining  = 0;
-static bool          g_chunked_in_ext     = false;  // in ";extension" tail of size line
-
-#define HTTPS_TIMEOUT_MS 20000
-// altcp_poll interval is in 500ms units; 4 = 2s
-#define HTTPS_POLL_INTERVAL 4
-
-static void mbedtls_debug_print(void *ctx, int level, const char *file, int line, const char *str) {
-    (void)ctx;
-    // strip trailing newline that mbedtls includes
-    size_t n = strlen(str);
-    while (n > 0 && (str[n-1] == '\n' || str[n-1] == '\r')) n--;
-    // strip the long path prefix from file
-    const char *base = strrchr(file, '/');
-    base = base ? base + 1 : file;
-    printf("[mbedtls L%d %s:%d] %.*s\n", level, base, line, (int)n, str);
-}
-
-static void https_cleanup(void) {
-    if (g_https_pcb) {
-        altcp_arg(g_https_pcb, NULL);
-        altcp_recv(g_https_pcb, NULL);
-        altcp_err(g_https_pcb, NULL);
-        altcp_poll(g_https_pcb, NULL, 0);
-        altcp_close(g_https_pcb);
-        g_https_pcb = NULL;
-    }
-}
-
-static void https_set_state(https_state_t s) {
-    g_https_state    = s;
-    g_https_state_at = board_millis();
-}
-
-static err_t https_poll_cb(void *arg, struct altcp_pcb *pcb) {
-    (void)arg; (void)pcb;
-    uint32_t elapsed = board_millis() - g_https_state_at;
-    printf("[https] poll: state=%d elapsed=%lums resp_len=%u\n",
-           (int)g_https_state, (unsigned long)elapsed, (unsigned)g_https_resp_len);
-    if (elapsed > HTTPS_TIMEOUT_MS) {
-        printf("[https] timeout in state %d\n", (int)g_https_state);
-        https_set_state(HC_DONE_ERR);
-        return ERR_ABRT;  // abort the connection
-    }
-    return ERR_OK;
-}
-
-static void https_err_cb(void *arg, err_t err) {
-    (void)arg;
-    printf("[https] err_cb err=%d state=%d\n", err, (int)g_https_state);
-    g_https_pcb = NULL;  // pcb already freed by lwIP
-    https_set_state(HC_DONE_ERR);
-}
-
-static err_t https_recv_cb(void *arg, struct altcp_pcb *pcb, struct pbuf *p, err_t err) {
-    (void)arg;
-    if (p == NULL || err != ERR_OK) {
-        // Remote closed → we're done
-        if (p) pbuf_free(p);
-        printf("[https] recv close (resp_len=%u err=%d)\n",
-               (unsigned)g_https_resp_len, err);
-        https_set_state(HC_DONE_OK);
-        return ERR_OK;
-    }
-    u16_t need = p->tot_len;
-    // If accepting this pbuf would overflow, try to make room by reclaiming
-    // already-played bytes inline (we're already holding the async_context
-    // lock, so just call the no-lock compaction directly).
-    if (g_https_resp_len + need >= sizeof(g_https_resp)) {
-        resp_compact_locked();
-    }
-    // Still no room → return ERR_MEM so lwIP keeps the pbuf and re-delivers
-    // it later. This is real TCP backpressure: the server's send window stays
-    // closed until we drain enough of g_https_resp via the pump.
-    if (g_https_resp_len + need >= sizeof(g_https_resp)) {
-        return ERR_MEM;
-    }
-    pbuf_copy_partial(p, g_https_resp + g_https_resp_len, need, 0);
-    g_https_resp_len += need;
-    g_https_resp[g_https_resp_len] = '\0';
-    altcp_recved(pcb, need);
-    pbuf_free(p);
-    https_check_complete();
-    return ERR_OK;
-}
-
-static err_t https_connected_cb(void *arg, struct altcp_pcb *pcb, err_t err) {
-    (void)arg;
-    if (err != ERR_OK) {
-        printf("[https] connect failed err=%d\n", err);
-        https_set_state(HC_DONE_ERR);
-        return ERR_OK;
-    }
-    printf("[https] TLS connected (after %lu ms), sending request (%u bytes, mode=%d)\n",
-           (unsigned long)(board_millis() - g_https_state_at),
-           (unsigned)g_https_req_len, (int)g_https_mode);
-    // For POSTs, the body may follow the headers — send everything we've prebuilt.
-    err_t werr = altcp_write(pcb, g_https_req, (u16_t)g_https_req_len, TCP_WRITE_FLAG_COPY);
-    if (werr != ERR_OK) {
-        printf("[https] write err=%d\n", werr);
-        https_set_state(HC_DONE_ERR);
-        return werr;
-    }
-    err_t oerr = altcp_output(pcb);
-    printf("[https] write ok (%u B), output err=%d\n", (unsigned)g_https_req_len, oerr);
-    https_set_state(HC_REQUESTING);
-    return ERR_OK;
-}
-
-// Fires when the server ACKs the bytes we sent. If this never fires, our
-// GET never reached the server's TCP stack.
-static err_t https_sent_cb(void *arg, struct altcp_pcb *pcb, u16_t len) {
-    (void)arg; (void)pcb;
-    printf("[https] sent ACK: %u bytes (elapsed=%lums in state=%d)\n",
-           len,
-           (unsigned long)(board_millis() - g_https_state_at),
-           (int)g_https_state);
-    return ERR_OK;
-}
-
-// Build "METHOD path HTTP/1.1\r\n..." into g_https_req. If body != NULL,
-// content_type and Content-Length are added automatically. Returns 0 on OK.
-static int https_build_request(const char *method,
-                               const char *path,
-                               const char *extra_headers,  // each ends in \r\n, may be NULL
-                               const char *content_type,   // only used if body != NULL
-                               const char *body,
-                               size_t      body_len) {
-    int n;
-    if (body) {
-        n = snprintf(g_https_req, sizeof(g_https_req),
-                     "%s %s HTTP/1.1\r\n"
-                     "Host: %s\r\n"
-                     "User-Agent: pico-lcd/1.0\r\n"
-                     "Accept: */*\r\n"
-                     "%s"
-                     "Content-Type: %s\r\n"
-                     "Content-Length: %u\r\n"
-                     "\r\n",
-                     method, path, g_https_host,
-                     extra_headers ? extra_headers : "",
-                     content_type ? content_type : "application/octet-stream",
-                     (unsigned)body_len);
-        if (n < 0 || (size_t)n + body_len >= sizeof(g_https_req)) {
-            printf("[https] request too long (hdr=%d body=%u)\n", n, (unsigned)body_len);
-            return -1;
-        }
-        memcpy(g_https_req + n, body, body_len);
-        g_https_req_len = (size_t)n + body_len;
-    } else {
-        n = snprintf(g_https_req, sizeof(g_https_req),
-                     "%s %s HTTP/1.1\r\n"
-                     "Host: %s\r\n"
-                     "User-Agent: pico-lcd/1.0\r\n"
-                     "Accept: */*\r\n"
-                     "%s"
-                     "\r\n",
-                     method, path, g_https_host,
-                     extra_headers ? extra_headers : "");
-        if (n < 0 || (size_t)n >= sizeof(g_https_req)) {
-            printf("[https] request too long (%d)\n", n);
-            return -1;
-        }
-        g_https_req_len = (size_t)n;
-    }
-    return 0;
-}
-
-static int https_request_start(const ip_addr_t *ip, const char *host) {
-    g_https_resp_len     = 0;
-    g_https_resp[0]      = '\0';
-    g_https_headers_done = false;
-    g_https_body_start   = 0;
-    g_https_content_len  = -1;
-    g_tts_sample_rate    = 24000;
-    g_https_chunked      = false;
-    g_chunked_read_pos   = 0;
-    g_chunked_write_pos  = 0;
-    g_chunked_state      = CHUNK_NEED_SIZE;
-    g_chunked_size_acc   = 0;
-    g_chunked_remaining  = 0;
-    g_chunked_in_ext     = false;
-
-    if (!g_tls_cfg) {
-        g_tls_cfg = altcp_tls_create_config_client(NULL, 0);
-        if (!g_tls_cfg) {
-            printf("[https] altcp_tls_create_config_client failed\n");
-            return -1;
-        }
-        // mbedtls internal debug: disabled (threshold=0). Flip to 1..4 to debug.
-        mbedtls_debug_set_threshold(0);
-        // ALPN disabled for now.
-    }
-    // g_https_host is set by network_init() — caller passes the same pointer in.
-
-    g_https_pcb = altcp_tls_new(g_tls_cfg, IPADDR_TYPE_V4);
-    if (!g_https_pcb) {
-        printf("[https] altcp_tls_new failed\n");
-        return -1;
-    }
-    // SNI hostname
-    mbedtls_ssl_set_hostname((mbedtls_ssl_context *)altcp_tls_context(g_https_pcb), host);
-
-    altcp_arg(g_https_pcb, NULL);
-    altcp_recv(g_https_pcb, https_recv_cb);
-    altcp_err(g_https_pcb,  https_err_cb);
-    altcp_sent(g_https_pcb, https_sent_cb);
-    altcp_poll(g_https_pcb, https_poll_cb, HTTPS_POLL_INTERVAL);
-
-    https_set_state(HC_CONNECTING);
-    printf("[https] connect %s:%d (%s) mode=%d\n",
-           host, HTTPS_PORT, ipaddr_ntoa(ip), (int)g_https_mode);
-    err_t err = altcp_connect(g_https_pcb, ip, HTTPS_PORT, https_connected_cb);
-    if (err != ERR_OK) {
-        printf("[https] altcp_connect err=%d\n", err);
-        https_cleanup();
-        https_set_state(HC_DONE_ERR);
-        return -1;
-    }
-    return 0;
-}
-
-// Find HTTP body in response (after \r\n\r\n)
-static const char *http_find_body(const char *resp, size_t len) {
-    const char *sep = "\r\n\r\n";
-    for (size_t i = 0; i + 3 < len; i++) {
-        if (memcmp(resp + i, sep, 4) == 0) return resp + i + 4;
-    }
-    return NULL;
-}
-
-// Case-insensitive search for "name:" in HTTP headers, returns pointer past ':' or NULL.
-static const char *http_find_header(const char *resp, size_t len, const char *name) {
-    size_t nlen = strlen(name);
-    for (size_t i = 0; i + nlen < len; i++) {
-        if (strncasecmp(resp + i, name, nlen) == 0 && resp[i + nlen] == ':') {
-            const char *p = resp + i + nlen + 1;
-            while (*p == ' ' || *p == '\t') p++;
-            return p;
-        }
-    }
-    return NULL;
-}
-
-// After new bytes arrived: detect end-of-headers, parse Content-Length, and
-// (if Content-Length known and reached) flip state to DONE_OK so the main loop
-// closes the connection without waiting for a TCP FIN.
-static void https_check_complete(void) {
-    if (!g_https_headers_done) {
-        const char *body = http_find_body(g_https_resp, g_https_resp_len);
-        if (!body) return;
-        g_https_body_start   = (size_t)(body - g_https_resp);
-        g_https_headers_done = true;
-
-        // Dump first ~256 bytes for visibility
-        size_t dump = g_https_resp_len < 256 ? g_https_resp_len : 256;
-        char saved = g_https_resp[dump];
-        g_https_resp[dump] = '\0';
-        printf("[https] head:\n%s\n", g_https_resp);
-        g_https_resp[dump] = saved;
-
-        const char *cl = http_find_header(g_https_resp, g_https_body_start, "Content-Length");
-        if (cl) {
-            g_https_content_len = atoi(cl);
-            printf("[https] Content-Length=%d body@%u\n",
-                   g_https_content_len, (unsigned)g_https_body_start);
-        } else {
-            printf("[https] no Content-Length (chunked?), will rely on FIN/timeout\n");
-        }
-        // True streaming for TTS: as soon as headers are parsed, configure the
-        // audio engine. core1's tts_forward_pump forwards decoded PCM to
-        // core0 in 1 KB chunks via IC_MSG_TTS_PCM_CHUNK; core0's
-        // tts_play_pump feeds those into the audio ring.
-        if (g_https_mode == HM_TTS) {
-            tts_apply_response_headers();
-            tts_start_playback();
-        }
-    }
-    if (g_https_headers_done && g_https_content_len >= 0) {
-        size_t body_have = g_https_resp_len - g_https_body_start;
-        if ((int)body_have >= g_https_content_len) {
-            printf("[https] body complete (%u/%d)\n",
-                   (unsigned)body_have, g_https_content_len);
-            https_set_state(HC_DONE_OK);
-        }
-    }
-}
 
 // Parse JSON, populate g_lab_ids / g_lab_count
 static int parse_lab_response(const char *body) {
@@ -851,104 +467,6 @@ static void tts_apply_response_headers(void) {
     printf("[tts] sample_rate=%u chunked=%d\n", (unsigned)hz, (int)g_https_chunked);
 }
 
-// Decode chunked transfer-encoding in-place inside g_https_resp[body_start...].
-// Reads from offset g_chunked_read_pos, writes decoded PCM bytes to offset
-// g_chunked_write_pos. Both offsets are relative to body_start. Write offset
-// is always <= read offset (framing only adds bytes), so memmove is safe.
-// Called from tts_forward_pump every iteration; resumes where last call left off.
-static void chunked_decode_in_place(void) {
-    uint8_t *base = (uint8_t *)g_https_resp + g_https_body_start;
-    size_t resp_have = g_https_resp_len - g_https_body_start;
-
-    while (g_chunked_read_pos < resp_have && g_chunked_state != CHUNK_DONE) {
-        uint8_t c = base[g_chunked_read_pos];
-        switch (g_chunked_state) {
-        case CHUNK_NEED_SIZE:
-            if (c == '\r') {
-                g_chunked_state = CHUNK_SIZE_SAW_CR;
-            } else if (c == ';') {
-                g_chunked_in_ext = true;
-            } else if (!g_chunked_in_ext) {
-                if      (c >= '0' && c <= '9') g_chunked_size_acc = g_chunked_size_acc * 16 + (c - '0');
-                else if (c >= 'a' && c <= 'f') g_chunked_size_acc = g_chunked_size_acc * 16 + (c - 'a' + 10);
-                else if (c >= 'A' && c <= 'F') g_chunked_size_acc = g_chunked_size_acc * 16 + (c - 'A' + 10);
-                // else: tolerate stray whitespace / unexpected chars silently
-            }
-            g_chunked_read_pos++;
-            break;
-        case CHUNK_SIZE_SAW_CR:
-            if (c == '\n') {
-                g_chunked_remaining = g_chunked_size_acc;
-                g_chunked_size_acc  = 0;
-                g_chunked_in_ext    = false;
-                printf("[chunked] new chunk size=%u at read_pos=%u (resp_have=%u write_pos=%u)\n",
-                       (unsigned)g_chunked_remaining, (unsigned)g_chunked_read_pos,
-                       (unsigned)resp_have, (unsigned)g_chunked_write_pos);
-                if (g_chunked_remaining == 0) {
-                    g_chunked_state = CHUNK_DONE;
-                    g_chunked_read_pos++;
-                    // Notify HTTPS layer that the body is complete (server uses
-                    // keep-alive so it won't FIN — we close from our side).
-                    if (g_https_state == HC_REQUESTING || g_https_state == HC_CONNECTING) {
-                        printf("[tts] chunked stream complete, closing\n");
-                        https_set_state(HC_DONE_OK);
-                    }
-                    return;
-                }
-                g_chunked_state = CHUNK_DATA;
-            }
-            g_chunked_read_pos++;
-            break;
-        case CHUNK_DATA: {
-            size_t avail = resp_have - g_chunked_read_pos;
-            size_t take  = (avail < g_chunked_remaining) ? avail : g_chunked_remaining;
-            if (take == 0) return;  // need more input
-            size_t prev_wp = g_chunked_write_pos;
-            if (g_chunked_write_pos != g_chunked_read_pos) {
-                memmove(base + g_chunked_write_pos,
-                        base + g_chunked_read_pos, take);
-            }
-            g_chunked_read_pos  += take;
-            g_chunked_write_pos += take;
-            g_chunked_remaining -= take;
-            if (g_chunked_remaining == 0) g_chunked_state = CHUNK_DATA_SAW_CR;
-            // One-shot dump: first time write_pos crosses 16 bytes, show layout
-            // + first 16 PCM bytes so we can cross-check against the pump side.
-            static bool dumped = false;
-            if (!dumped && g_chunked_write_pos >= 16) {
-                dumped = true;
-                uint8_t *pcm = base;  // == g_https_resp + body_start
-                printf("[decoder] resp=%p body_start=%u write_pos=%u "
-                       "base=%p decoded_end=%p\n",
-                       (void*)g_https_resp, (unsigned)g_https_body_start,
-                       (unsigned)g_chunked_write_pos,
-                       (void*)base, (void*)(base + g_chunked_write_pos));
-                printf("[decoder] first16:");
-                for (int i = 0; i < 16; i++) printf(" %02x", pcm[i]);
-                printf(" (prev_wp=%u take=%u)\n",
-                       (unsigned)prev_wp, (unsigned)take);
-            }
-            break;
-        }
-        case CHUNK_DATA_SAW_CR:
-            // expect \r — server is well-formed, just skip
-            if (c == '\r') g_chunked_state = CHUNK_NEED_SIZE;  // next we want \n then size
-            // We collapse both \r and \n by reusing CHUNK_NEED_SIZE which
-            // tolerates \n at the start (hex digit accumulator ignores it).
-            // Actually \n won't match hex/CR/; — accumulator simply doesn't
-            // bump. Cleaner: handle as separate state.
-            g_chunked_read_pos++;
-            // Need to also consume the LF after CR before next size hex.
-            // Use a small inline loop: peek next byte if present.
-            if (g_chunked_read_pos < resp_have && base[g_chunked_read_pos] == '\n') {
-                g_chunked_read_pos++;
-            }
-            break;
-        case CHUNK_DONE:
-            return;
-        }
-    }
-}
 
 // Arm streaming playback. Called the moment response headers parse — body
 // bytes will arrive later via recv_cb appending to g_https_resp;
@@ -981,6 +499,22 @@ static void tts_start_playback(void) {
     printf("[tts] playback armed: body@%u resp_len=%u initial_body=%u Hz=%u\n",
            (unsigned)g_https_body_start, (unsigned)g_https_resp_len,
            (unsigned)body_have, (unsigned)g_tts_sample_rate);
+}
+
+// Hook called from src/http.c when response headers are parsed in HM_TTS
+// mode — gives us a chance to read X-Sample-Rate / Transfer-Encoding and
+// arm the audio engine before the body finishes streaming.
+void http_on_tts_headers_done(void) {
+    tts_apply_response_headers();
+    tts_start_playback();
+}
+
+// Hook called from src/http.c (inside the lwIP recv callback) when the
+// next pbuf would overflow g_https_resp — we reclaim already-played bytes
+// inline. The recv path already holds the async_context lock, so the
+// no-lock variant is what we need here.
+void http_on_recv_overflow(void) {
+    resp_compact_locked();
 }
 
 static void https_handle_done(void) {
@@ -1050,8 +584,8 @@ static void https_handle_done(void) {
         break;
     }
 
-    https_cleanup();
-    https_set_state(HC_IDLE);
+    http_cleanup();
+    http_set_state(HC_IDLE);
     mem_barrier();
 }
 
@@ -1060,10 +594,10 @@ static void https_handle_done(void) {
 //=============================================================================
 static int kick_info_request(void) {
     g_https_mode = HM_INFO;
-    if (https_build_request("GET", API_PATH,
+    if (http_build_request("GET", API_PATH,
                             "X-Device-Id: " DEVICE_ID "\r\n",
                             NULL, NULL, 0) != 0) return -1;
-    return https_request_start(&g_api_ip, g_https_host);
+    return http_request_start(&g_api_ip, g_https_host);
 }
 
 // We remember which operator's timeline we're polling. Set by core1 when
@@ -1081,10 +615,10 @@ static int kick_timeline_request(void) {
         printf("[timeline] path overflow\n");
         return -1;
     }
-    if (https_build_request("GET", path,
+    if (http_build_request("GET", path,
                             "X-Device-Id: " DEVICE_ID "\r\n",
                             NULL, NULL, 0) != 0) return -1;
-    return https_request_start(&g_api_ip, g_https_host);
+    return http_request_start(&g_api_ip, g_https_host);
 }
 
 // Escape ASCII control / quote / backslash for JSON string body. UTF-8 multi-
@@ -1145,12 +679,12 @@ static int kick_tts_request(const char *message) {
     }
     printf("[tts] POST body (%d B): %s\n", blen, body);
 
-    if (https_build_request("POST", TTS_PATH,
+    if (http_build_request("POST", TTS_PATH,
                             "X-Device-Id: " DEVICE_ID "\r\n"
                             "X-Sample-Rate: 24000\r\n",
                             "application/json",
                             body, (size_t)blen) != 0) return -1;
-    return https_request_start(&g_api_ip, g_https_host);
+    return http_request_start(&g_api_ip, g_https_host);
 }
 
 // Copy as much pending PCM as fits into the audio ring, advance position.
@@ -1291,7 +825,7 @@ static bool tts_forward_pump(void) {
     // Convert chunked-TE framing → raw PCM bytes in-place. After this
     // call, body[0..g_chunked_write_pos) holds decoded PCM (non-chunked
     // bodies leave both offsets at 0 and we use resp_len directly).
-    if (g_https_chunked) chunked_decode_in_place();
+    if (g_https_chunked) http_chunked_decode_in_place();
 
     size_t body_have = g_https_chunked
                          ? g_chunked_write_pos
@@ -1804,7 +1338,7 @@ static void on_core1_running(void) {
         if (g_core1_fetch_pending && !https_busy) {
             g_core1_fetch_pending = false;
             printf("[core1] HTTPS GET info\n");
-            if (kick_info_request() != 0) https_set_state(HC_DONE_ERR);
+            if (kick_info_request() != 0) http_set_state(HC_DONE_ERR);
         }
 
         // TTS queue processing — always, regardless of polling mode. This
@@ -1816,7 +1350,7 @@ static void on_core1_running(void) {
                 printf("[core1] POST tts (queue=%d)\n", tts_queue_count());
                 if (kick_tts_request(msg) != 0) {
                     tts_queue_pop();
-                    https_set_state(HC_DONE_ERR);
+                    http_set_state(HC_DONE_ERR);
                 }
                 https_busy = true;  // hold off polling kickoff this iter
             }
@@ -1829,7 +1363,7 @@ static void on_core1_running(void) {
             if ((now - g_timeline_last_poll) >= TIMELINE_POLL_INTERVAL_MS) {
                 g_timeline_last_poll = now;
                 printf("[core1] GET timeline\n");
-                if (kick_timeline_request() != 0) https_set_state(HC_DONE_ERR);
+                if (kick_timeline_request() != 0) http_set_state(HC_DONE_ERR);
             }
         }
 
@@ -2094,7 +1628,7 @@ static void on_core0_running(void) {
             if (g_timeline_status_ver != last_tl_status_ver && g_view == VIEW_LABS) {
                 last_tl_status_ver = g_timeline_status_ver;
                 set_status("TL: pid=%lld q=%d", (long long)g_last_publish_id,
-                           (g_tts_tail - g_tts_head + TTS_QUEUE_SIZE * 2) % TTS_QUEUE_SIZE);
+                           tts_queue_count());
             }
         }
         if ((now - fast_last) >= 100) {

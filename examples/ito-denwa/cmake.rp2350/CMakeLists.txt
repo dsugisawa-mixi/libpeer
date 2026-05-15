@@ -74,6 +74,8 @@ ADD_EXECUTABLE(
     ${CMAKE_CURRENT_LIST_DIR}/../src/st7789.c
     ${CMAKE_CURRENT_LIST_DIR}/../src/audio.c
     ${CMAKE_CURRENT_LIST_DIR}/../src/ic_ring.c
+    ${CMAKE_CURRENT_LIST_DIR}/../src/http.c
+    ${CMAKE_CURRENT_LIST_DIR}/../src/queue.c
     ${CMAKE_CURRENT_LIST_DIR}/../main.c
 )
 
