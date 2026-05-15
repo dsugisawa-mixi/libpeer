@@ -23,8 +23,8 @@ void tts_send_end_if_needed(void);
 
 // Build and send a TTS POST request via the HTTPS client.
 // ip/host are the resolved API endpoint.
-struct ip_addr;
-int tts_kick_request(const char *message, const struct ip_addr *ip, const char *host);
+#include "lwip/ip_addr.h"
+int tts_kick_request(const char *message, const ip_addr_t *ip, const char *host);
 
 // Core0: drain g_core0_pcm_pending into the audio ring.
 // Returns true while playback is in flight.

@@ -22,6 +22,7 @@
 uint8_t           g_core0_pcm_pending[TTS_PCM_PENDING_CAP];
 volatile size_t   g_core0_pcm_pending_len = 0;
 volatile bool     g_core0_tts_stream_done = false;
+volatile size_t   g_tts_play_pos = 0;
 
 //=============================================================================
 // Private state
