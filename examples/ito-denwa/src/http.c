@@ -115,7 +115,9 @@ int http_kick_info(const char *device_id) {
     g_https_mode = HM_INFO;
     char hdr[128];
     snprintf(hdr, sizeof(hdr), "X-Device-Id: %s\r\n", device_id);
-    if (http_build_request("GET", "/api/tunnel/info", hdr,
+    // ?t=simple → server omits recent_additions, response stays a few KB so
+    // RESP_BUF_SIZE can be 16 KB instead of 160 KB.
+    if (http_build_request("GET", "/api/tunnel/info?t=simple", hdr,
                             NULL, NULL, 0) != 0) return -1;
     return http_request_start(&g_api_ip, g_https_host);
 }

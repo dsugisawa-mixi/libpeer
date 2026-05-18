@@ -216,10 +216,11 @@ void audio_test_stream_sine(void) {
         }
     }
     // Overwrite the entire ring with silence so the DMA doesn't wrap around
-    // and re-play the trailing sine forever. (2304 zero samples > 2048 ring
-    // size guarantees full coverage.)
+    // and re-play the trailing sine forever. Need > BUF_FRAMES samples; with
+    // 256-sample blocks that's ceil(BUF_FRAMES/256)+1 blocks.
     int16_t zero_block[256] = {0};
-    for (int t = 0; t < 9; t++) {
+    const int wipe_blocks = (BUF_FRAMES / 256) + 1;
+    for (int t = 0; t < wipe_blocks; t++) {
         size_t off = 0;
         int spin = 0;
         while (off < 256) {
@@ -246,8 +247,8 @@ typedef enum {
     TEST_PHASE_DONE,
 } test_phase_t;
 
-#define TEST_SINE_BLOCKS     48   // 48 × 256 / 24000 ≈ 0.5s sine
-#define TEST_SILENCE_BLOCKS  9    // > BUF_FRAMES / 256 → guarantees full wipe
+#define TEST_SINE_BLOCKS     48                       // 48 × 256 / 24000 ≈ 0.5s sine
+#define TEST_SILENCE_BLOCKS  ((BUF_FRAMES / 256) + 1) // > BUF_FRAMES / 256 → guarantees full wipe
 #define TEST_BLOCK_SAMPLES   256
 #define TEST_STUCK_MS        500
 
@@ -334,17 +335,36 @@ void audio_stop(void) {
 }
 
 // Underrun handler. If the writer's absolute counter has fallen behind the
-// DMA, zero the entire audio ring and snap g_write_abs forward to the DMA
-// position. Without the zeroing, DMA keeps reading the trailing ring_size
-// samples and you hear the last word looping ("a-ri-ii-ii-igatou..."). On
-// underrun we'd rather emit silence than re-play stale audio. `r` is the
-// caller's already-read DMA position. Returns true if an underrun was
-// handled (so the caller knows used=0, free=max).
+// DMA, zero a bounded region ahead of the DMA read position and snap
+// g_write_abs forward. Without the zeroing, DMA keeps reading the trailing
+// ring_size samples and you hear the last word looping
+// ("a-ri-ii-ii-igatou..."). On underrun we'd rather emit silence than
+// re-play stale audio.
+//
+// We DELIBERATELY do not wipe the entire ring: the full wipe creates a
+// full ring-duration silence gap (~85ms with the 16KB ring) on every
+// underrun. Instead we silence ~1/4 of the ring (~21ms @ 24kHz) starting
+// at the DMA read position — long enough to mask the stale-loop while the
+// writer catches up, short enough that the audible glitch is brief. If
+// the writer is still behind on the next call, this fires again and
+// silences another region (the bound is per-call, not cumulative).
+//
+// `r` is the caller's already-read DMA position. Returns true if an
+// underrun was handled (so the caller knows used=0, free=max).
+#define UNDERRUN_SILENCE_WORDS  (BUF_WORDS / 4)
 static bool audio_check_underrun(uint32_t r) {
     int32_t diff = (int32_t)(g_write_abs - r);
     if (diff >= 0) return false;
 
-    memset(g_audio_buf, 0, sizeof g_audio_buf);
+    uint32_t start = r & (BUF_WORDS - 1);
+    uint32_t end   = start + UNDERRUN_SILENCE_WORDS;
+    if (end <= BUF_WORDS) {
+        memset(&g_audio_buf[start], 0, UNDERRUN_SILENCE_WORDS * 4);
+    } else {
+        uint32_t first = BUF_WORDS - start;
+        memset(&g_audio_buf[start], 0, first * 4);
+        memset(&g_audio_buf[0],     0, (UNDERRUN_SILENCE_WORDS - first) * 4);
+    }
     __sync_synchronize();
     g_write_abs = r & ~1u;   // even-align onto stereo-frame boundary
 
@@ -352,7 +372,8 @@ static bool audio_check_underrun(uint32_t r) {
     uint32_t now = to_ms_since_boot(get_absolute_time());
     if ((now - last_log) >= 250) {
         last_log = now;
-        printf("[audio] underrun: ring zeroed (gap=%d words)\n", (int)-diff);
+        printf("[audio] underrun: silenced %u words (gap=%d words)\n",
+               (unsigned)UNDERRUN_SILENCE_WORDS, (int)-diff);
     }
     return true;
 }
