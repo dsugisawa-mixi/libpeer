@@ -206,7 +206,10 @@ static int parse_timeline_response(const char *body) {
         if (!cJSON_IsNumber(pid) || !cJSON_IsString(msg) || !msg->valuestring) continue;
         int64_t this_pid = (int64_t)pid->valuedouble;
         if (this_pid <= g_last_publish_id) continue;
-        if (tts_queue_push(msg->valuestring)) new_count++;
+        cJSON *voice = cJSON_GetObjectItem(it, "voice");
+        const char *gender = (cJSON_IsString(voice) && voice->valuestring)
+                                 ? voice->valuestring : NULL;
+        if (tts_queue_push(msg->valuestring, gender)) new_count++;
         if (this_pid > max_seen) max_seen = this_pid;
     }
     if (max_seen > g_last_publish_id) g_last_publish_id = max_seen;

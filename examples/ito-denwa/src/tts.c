@@ -99,8 +99,9 @@ static int json_escape(char *dst, size_t dst_sz, const char *src) {
     return (int)o;
 }
 
-int tts_kick_request(const char *message, const ip_addr_t *ip,
-                     const char *host, const char *device_id) {
+int tts_kick_request(const char *message, const char *gender,
+                     const ip_addr_t *ip, const char *host,
+                     const char *device_id) {
     g_https_mode = HM_TTS;
 
     char body[TTS_MSG_LEN * 2 + 96];
@@ -109,10 +110,11 @@ int tts_kick_request(const char *message, const ip_addr_t *ip,
         printf("[tts] escape overflow\n");
         return -1;
     }
+    const char *g = (gender && *gender) ? gender : "male";
     int blen = snprintf(body, sizeof(body),
-                        "{\"gender\":\"male\",\"style\":\"neutral\","
+                        "{\"gender\":\"%s\",\"style\":\"neutral\","
                         "\"out_lang\":\"ja\",\"text\":\"%s\"}",
-                        escaped);
+                        g, escaped);
     if (blen < 0 || (size_t)blen >= sizeof(body)) {
         printf("[tts] body overflow\n");
         return -1;

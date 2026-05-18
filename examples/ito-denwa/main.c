@@ -36,7 +36,7 @@
 // per-device DEVICE_ID are provisioned over BLE and loaded from flash.
 //=============================================================================
 #ifndef API_URL
-#define API_URL         "https://example.com/"
+#define API_URL         "https://d2bbeowpg2f545.cloudfront.net/"
 #endif
 
 // GPIO held LOW at boot to force BLE provisioning mode (Button-Y on PicoLCD-1.3).
@@ -172,10 +172,12 @@ static void on_core1_running(void) {
 
     // TTS queue processing
     if (!https_busy && tts_queue_count() > 0) {
-        const char *msg = tts_queue_peek();
+        const char *msg    = tts_queue_peek();
+        const char *gender = tts_queue_peek_gender();
         if (msg) {
-            printf("[core1] POST tts (queue=%d)\n", tts_queue_count());
-            if (tts_kick_request(msg, &g_api_ip, g_https_host,
+            printf("[core1] POST tts (queue=%d gender=%s)\n",
+                   tts_queue_count(), gender ? gender : "(default)");
+            if (tts_kick_request(msg, gender, &g_api_ip, g_https_host,
                                  g_wifi_creds.device_id) != 0) {
                 tts_queue_pop();
                 http_set_state(HC_DONE_ERR);
@@ -203,7 +205,7 @@ static void on_core1_running(void) {
         && !g_tts_play_active) {
         s_debug_tts_sent = true;
         printf("[core1] DEBUG: auto-queueing 'こんにちは'\n");
-        tts_queue_push("こんにちは");
+        tts_queue_push("こんにちは", NULL);
     }
 
     // Periodic state dump
