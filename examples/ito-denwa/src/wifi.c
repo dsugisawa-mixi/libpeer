@@ -16,7 +16,7 @@
 //=============================================================================
 // WiFi initialization (detailed timing)
 //=============================================================================
-int wifi_init(void) {
+int wifi_init(const char *ssid, const char *password) {
     int last_status = CYW43_LINK_DOWN;
     int status;
     uint32_t now;
@@ -26,15 +26,24 @@ int wifi_init(void) {
     uint32_t time_wifi_scan_start;
     uint32_t time_dhcp_start = 0;
 
+    if (!ssid || !ssid[0]) {
+        printf("[wifi] empty SSID — refusing to connect\n");
+        set_status("WiFi: no SSID");
+        return -1;
+    }
+    // Open networks: pass NULL password + AUTH_OPEN. Otherwise WPA2-PSK.
+    bool open_ap = (password == NULL) || (password[0] == '\0');
+    uint32_t auth = open_ap ? CYW43_AUTH_OPEN : CYW43_AUTH_WPA2_AES_PSK;
+
     cyw43_arch_enable_sta_mode();
 
     time_wifi_start      = board_millis();
     time_wifi_scan_start = time_wifi_start;
     printf("[TIMING] WiFi scan start: %lu ms\n", (unsigned long)time_wifi_scan_start);
-    printf("Connecting to WiFi '%s'...\n", WIFI_SSID);
-    set_status("WiFi: '%s' scan...", WIFI_SSID);
+    printf("Connecting to WiFi '%s'...\n", ssid);
+    set_status("WiFi: '%s' scan...", ssid);
 
-    if (cyw43_arch_wifi_connect_async(WIFI_SSID, WIFI_PASSWORD, CYW43_AUTH_WPA2_AES_PSK) != 0) {
+    if (cyw43_arch_wifi_connect_async(ssid, password, auth) != 0) {
         printf("WiFi connect_async failed\n");
         set_status("WiFi: connect_async fail");
         return -1;
@@ -180,8 +189,9 @@ int dns_resolve_blocking(const char *hostname, ip_addr_t *out) {
 
 ip_addr_t g_api_ip;
 
-int network_init(void) {
-    if (wifi_init() != 0) return -1;
+int network_init(const wifi_creds_t *creds) {
+    if (!creds) return -1;
+    if (wifi_init(creds->ssid, creds->password) != 0) return -1;
     srand(board_millis());
 
     char hostname[128];

@@ -22,9 +22,11 @@ void tts_start_playback(void);
 void tts_send_end_if_needed(void);
 
 // Build and send a TTS POST request via the HTTPS client.
-// ip/host are the resolved API endpoint.
+// ip/host are the resolved API endpoint. device_id is the BLE-provisioned
+// per-device UUID consumed by the API for auth (sent as X-Device-Id).
 #include "lwip/ip_addr.h"
-int tts_kick_request(const char *message, const ip_addr_t *ip, const char *host);
+int tts_kick_request(const char *message, const ip_addr_t *ip,
+                     const char *host, const char *device_id);
 
 // Core0: drain g_core0_pcm_pending into the audio ring.
 // Returns true while playback is in flight.

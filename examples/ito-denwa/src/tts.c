@@ -11,9 +11,6 @@
 #include "queue.h"
 #include "gui.h"      // g_tts_play_active
 
-#ifndef DEVICE_ID
-#define DEVICE_ID "1b505f7a-4e7b-11f1-a1dd-d83addf43636"
-#endif
 #define TTS_PATH  "/api/tts/generate_stream"
 
 //=============================================================================
@@ -102,7 +99,8 @@ static int json_escape(char *dst, size_t dst_sz, const char *src) {
     return (int)o;
 }
 
-int tts_kick_request(const char *message, const ip_addr_t *ip, const char *host) {
+int tts_kick_request(const char *message, const ip_addr_t *ip,
+                     const char *host, const char *device_id) {
     g_https_mode = HM_TTS;
 
     char body[TTS_MSG_LEN * 2 + 96];
@@ -121,9 +119,14 @@ int tts_kick_request(const char *message, const ip_addr_t *ip, const char *host)
     }
     printf("[tts] POST body (%d B): %s\n", blen, body);
 
-    if (http_build_request("POST", TTS_PATH,
-                            "X-Device-Id: " DEVICE_ID "\r\n"
-                            "X-Sample-Rate: 24000\r\n",
+    // Header line is built at runtime now (used to be a string-literal concat
+    // with a build-time DEVICE_ID macro). info/timeline already do the same.
+    char hdr[160];
+    snprintf(hdr, sizeof(hdr),
+             "X-Device-Id: %s\r\n"
+             "X-Sample-Rate: 24000\r\n",
+             device_id ? device_id : "");
+    if (http_build_request("POST", TTS_PATH, hdr,
                             "application/json",
                             body, (size_t)blen) != 0) return -1;
     return http_request_start(ip, host);

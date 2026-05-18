@@ -28,24 +28,27 @@
 #include "led.h"
 #include "wifi.h"
 #include "tts.h"
+#include "credentials.h"
+#include "ble_provision.h"
 
 //=============================================================================
-// Configuration — set via environment variables or defaults below
+// Configuration — only API_URL stays at build time; WiFi creds *and*
+// per-device DEVICE_ID are provisioned over BLE and loaded from flash.
 //=============================================================================
-#ifndef WIFI_SSID
-#define WIFI_SSID       "your-wifi-ssid"
-#endif
-#ifndef WIFI_PASSWORD
-#define WIFI_PASSWORD   "your-wifi-password"
-#endif
 #ifndef API_URL
 #define API_URL         "https://example.com/"
 #endif
-#ifndef DEVICE_ID
-#define DEVICE_ID       "1b505f7a-4e7b-11f1-a1dd-d83addf43636"
-#endif
+
+// GPIO held LOW at boot to force BLE provisioning mode (Button-Y on PicoLCD-1.3).
+#define PROV_BUTTON_PIN  21
 
 #define TIMELINE_POLL_INTERVAL_MS 10000
+
+//=============================================================================
+// Runtime WiFi credentials — loaded from flash by core0 main(), consumed by
+// core1's network_init() once both cores are up.
+//=============================================================================
+static wifi_creds_t g_wifi_creds;
 
 //=============================================================================
 // Inter-core state machine — types and shared state
@@ -129,7 +132,7 @@ static void on_core1_init(void) {
 }
 
 static void on_core1_network(void) {
-    if (network_init() != 0) {
+    if (network_init(&g_wifi_creds) != 0) {
         printf("core1: network init failed\n");
         set_status("Net: init failed");
         HALT();
@@ -164,7 +167,7 @@ static void on_core1_running(void) {
     if (g_core1_fetch_pending && !https_busy) {
         g_core1_fetch_pending = false;
         printf("[core1] HTTPS GET info\n");
-        if (http_kick_info(DEVICE_ID) != 0) http_set_state(HC_DONE_ERR);
+        if (http_kick_info(g_wifi_creds.device_id) != 0) http_set_state(HC_DONE_ERR);
     }
 
     // TTS queue processing
@@ -172,7 +175,8 @@ static void on_core1_running(void) {
         const char *msg = tts_queue_peek();
         if (msg) {
             printf("[core1] POST tts (queue=%d)\n", tts_queue_count());
-            if (tts_kick_request(msg, &g_api_ip, g_https_host) != 0) {
+            if (tts_kick_request(msg, &g_api_ip, g_https_host,
+                                 g_wifi_creds.device_id) != 0) {
                 tts_queue_pop();
                 http_set_state(HC_DONE_ERR);
             }
@@ -186,7 +190,8 @@ static void on_core1_running(void) {
         if ((now - g_timeline_last_poll) >= TIMELINE_POLL_INTERVAL_MS) {
             g_timeline_last_poll = now;
             printf("[core1] GET timeline\n");
-            if (http_kick_timeline(DEVICE_ID, g_timeline_operator_id,
+            if (http_kick_timeline(g_wifi_creds.device_id,
+                                   g_timeline_operator_id,
                                    g_last_publish_id) != 0)
                 http_set_state(HC_DONE_ERR);
         }
@@ -468,6 +473,48 @@ static void handle_core0_notify(ic_msg_t type, const uint8_t *payload, uint16_t 
 }
 
 //=============================================================================
+// Provisioning bootmode — runs entirely on core0, never returns. On
+// successful Commit we save to flash and reboot so the normal boot path
+// picks up the new creds. We deliberately don't launch core1 here so the
+// flash write doesn't have to fight WiFi/lwIP for the bus.
+//=============================================================================
+static void run_provisioning_and_reboot(void) {
+    set_status("BLE prov mode");
+    render_status_view();
+
+    if (cyw43_arch_init()) {
+        printf("[prov] cyw43_arch_init failed\n");
+        set_status("BLE: init fail");
+        HALT();
+    }
+
+    wifi_creds_t creds = {0};
+    // 0 = no timeout — user holds the device until done.
+    if (ble_provision_run(&creds, 0) != 0) {
+        printf("[prov] aborted\n");
+        set_status("BLE: aborted");
+        HALT();
+    }
+
+    // Switch back to the status log view so the user sees save/reboot
+    // progress — the provisioning view (all checkmarks) hides further
+    // set_status output otherwise.
+    set_status("Saving to flash...");
+    render_status_view();
+
+    if (creds_save(&creds) != 0) {
+        set_status("Flash save fail");
+        render_status_view();
+        HALT();
+    }
+    set_status("Saved. Reboot...");
+    render_status_view();
+    sleep_ms(1500);
+    watchdog_reboot(0, 0, 100);
+    while (1) tight_loop_contents();
+}
+
+//=============================================================================
 // Entry point (runs on Core 0)
 //=============================================================================
 int main() {
@@ -484,9 +531,23 @@ int main() {
     printf("[TIMING] Boot complete: %lu ms\n", (unsigned long)g_time_boot);
 
     lcd_init();
-    buttons_init();
+    buttons_init();   // also configures PROV_BUTTON_PIN with pull-up
     set_status("Boot %lums", (unsigned long)g_time_boot);
     render_status_view();
+
+    // Determine bootmode:
+    //  - User holds Button-Y at boot   → force BLE provisioning
+    //  - No valid creds in flash        → fall through to provisioning
+    //  - Otherwise                      → normal WiFi/HTTPS boot
+    sleep_ms(50);  // let GPIO pulls settle
+    bool button_held = (gpio_get(PROV_BUTTON_PIN) == 0);
+    bool have_creds  = (creds_load(&g_wifi_creds) == 0);
+    printf("[boot] button_held=%d have_creds=%d\n", button_held, have_creds);
+
+    if (button_held || !have_creds) {
+        set_status(button_held ? "BLE: forced" : "BLE: no creds");
+        run_provisioning_and_reboot();  // never returns
+    }
 
     ic_init();
 
