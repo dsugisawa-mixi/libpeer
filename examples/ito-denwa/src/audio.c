@@ -20,12 +20,14 @@
 // carrying the 16-bit sample with 1 delay bit + 15 padding bits as required
 // by Philips I2S). So a ring of N stereo frames needs 2*N words.
 //
-// 16KB ring (2048 stereo frames × 2 words × 4 bytes) → ~85ms @ 24kHz.
+// 32KB ring (4096 stereo frames × 2 words × 4 bytes) → ~170ms @ 24kHz.
 // Buffer must be aligned to its size for the DMA ring wrap trick.
-#define BUF_FRAMES      2048
-#define BUF_WORDS       (BUF_FRAMES * 2)        // 4096 uint32 words
-#define BUF_BYTES       (BUF_WORDS * 4)         // 16 KB
-#define BUF_RING_BITS   14                      // log2(BUF_BYTES)
+// RP2350 channel_config_set_ring upper bound is 15 bits (32KB) in practice;
+// 16 bits silently broke the wrap and produced full silence in earlier tests.
+#define BUF_FRAMES      4096
+#define BUF_WORDS       (BUF_FRAMES * 2)        // 8192 uint32 words
+#define BUF_BYTES       (BUF_WORDS * 4)         // 32 KB
+#define BUF_RING_BITS   15                      // log2(BUF_BYTES)
 
 static int g_audio_sm = -1;
 static int g_dma_ch   = -1;
@@ -342,16 +344,20 @@ void audio_stop(void) {
 // re-play stale audio.
 //
 // We DELIBERATELY do not wipe the entire ring: the full wipe creates a
-// full ring-duration silence gap (~85ms with the 16KB ring) on every
-// underrun. Instead we silence ~1/4 of the ring (~21ms @ 24kHz) starting
-// at the DMA read position — long enough to mask the stale-loop while the
-// writer catches up, short enough that the audible glitch is brief. If
-// the writer is still behind on the next call, this fires again and
-// silences another region (the bound is per-call, not cumulative).
+// full ring-duration silence gap on every underrun. Instead we silence a
+// fixed ~21ms (@ 24kHz) region starting at the DMA read position — long
+// enough to mask the stale-loop while the writer catches up, short enough
+// that the audible glitch is brief. If the writer is still behind on the
+// next call, this fires again and silences another region (the bound is
+// per-call, not cumulative).
+//
+// Keep this an absolute duration, NOT a fraction of BUF_WORDS — otherwise
+// growing the ring proportionally lengthens each silence and eats the
+// latency budget the bigger ring was supposed to buy.
 //
 // `r` is the caller's already-read DMA position. Returns true if an
 // underrun was handled (so the caller knows used=0, free=max).
-#define UNDERRUN_SILENCE_WORDS  (BUF_WORDS / 4)
+#define UNDERRUN_SILENCE_WORDS  1024u   // ~21ms @ 24kHz stereo (512 frames)
 static bool audio_check_underrun(uint32_t r) {
     int32_t diff = (int32_t)(g_write_abs - r);
     if (diff >= 0) return false;

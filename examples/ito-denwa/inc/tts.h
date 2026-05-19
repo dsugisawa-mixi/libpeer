@@ -7,7 +7,13 @@
 #include <stdint.h>
 
 #define TTS_FWD_CHUNK_SIZE   1024
-#define TTS_PCM_PENDING_CAP  4096
+#define TTS_PCM_PENDING_CAP  8192
+// Raw HTTP body bytes that must accumulate (~chunk-header overhead is
+// negligible) before audio playback is armed. Arming earlier means the DMA
+// ring is empty when the I2S engine starts reading and the first ~ring-
+// worth of audio is silence + underrun spam. 8 KB ≈ 170 ms @ 24 kHz mono
+// int16 — matches the 32 KB DMA ring (one full lap of cushion).
+#define TTS_PREBUFFER_BYTES  8192
 
 // Pending PCM staging buffer — core0 drains via tts_play_pump().
 // Written by handle_core0_notify (IC_MSG_TTS_PCM_CHUNK).

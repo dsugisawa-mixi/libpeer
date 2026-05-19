@@ -337,11 +337,21 @@ static void http_check_complete(void) {
         } else {
             printf("[https] no Content-Length (chunked?), will rely on FIN/timeout\n");
         }
-        // True streaming for TTS: parse X-Sample-Rate / Transfer-Encoding,
-        // then hand off to the application so it can arm the audio engine.
-        // core1's tts_forward_pump will then ship decoded PCM chunk-by-chunk.
+        // True streaming for TTS: parse X-Sample-Rate / Transfer-Encoding
+        // now so we know how to drive the I2S clock and how to read the
+        // body. Defer arming the audio engine until we have prebuffered
+        // enough body — see below.
         if (g_https_mode == HM_TTS) {
             http_apply_tts_headers();
+        }
+    }
+    // Per-arrival: arm TTS playback once enough raw body has buffered so
+    // the DMA ring isn't drained dry by the I2S engine before the forward
+    // pump can fill it. Fallback arming (response finished below
+    // prebuffer) is handled in https_handle_done.
+    if (g_https_headers_done && g_https_mode == HM_TTS && !g_tts_play_active) {
+        size_t body_have = g_https_resp_len - g_https_body_start;
+        if (body_have >= TTS_PREBUFFER_BYTES) {
             tts_start_playback();
         }
     }
