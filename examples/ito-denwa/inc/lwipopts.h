@@ -34,10 +34,16 @@
 #define LWIP_ICMP                   1
 #define LWIP_RAW                    0     // raw sockets not needed for HTTPS
 #define TCP_MSS                     1460
-// TCP_WND must be larger than the largest TLS record (16KB + overhead).
-// With the default 4*MSS=5840 the receiver deadlocks: a 7KB TLS record can't
-// fit in the window, server stops sending, mbedtls waits, no progress.
-#define TCP_WND                     (16 * TCP_MSS)
+// TCP_WND must be larger than the largest TLS record (16KB + overhead) —
+// with the default 4*MSS=5840 the receiver deadlocks: a 7KB TLS record
+// can't fit in the window, server stops sending, mbedtls waits, no
+// progress.
+// Held at 12*MSS (~17.5KB) as a compromise: still above the 16KB TLS
+// record bound (safe), but small enough that CloudFront's per-burst send
+// can't grow as large as before. This reduces "send 22KB → wait → send
+// 22KB" bursting toward smoother MSS-paced delivery. Going below 16KB
+// requires negotiating TLS max_fragment_length first.
+#define TCP_WND                     (12 * TCP_MSS)
 #define TCP_SND_BUF                 (16 * TCP_MSS)
 #define TCP_SND_QUEUELEN            ((4 * (TCP_SND_BUF) + (TCP_MSS - 1)) / (TCP_MSS))
 #define LWIP_NETIF_STATUS_CALLBACK  1

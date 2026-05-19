@@ -170,7 +170,10 @@ bool tts_play_pump(void) {
 
     if (stream_done && source_drained && g_tts_pad_remaining == 0
         && g_tts_play_active) {
-        g_tts_pad_remaining = 2304;
+        // Must wipe the FULL DMA ring; otherwise ENDLESS DMA keeps reading
+        // the stale PCM tail and we hear a periodic "chi-chi-chi" loop at
+        // ring-lap frequency.
+        g_tts_pad_remaining = (size_t)BUF_FRAMES + 256u;
     }
 
     if (g_tts_pad_remaining > 0) {

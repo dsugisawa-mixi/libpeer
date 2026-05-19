@@ -3,6 +3,11 @@
 #include <stdint.h>
 #include <stddef.h>
 
+// DMA ring size in stereo frames. Streaming clients use this to size an
+// end-of-stream silence pad that fully wipes the ring (ENDLESS DMA keeps
+// reading the last words otherwise — the "chi-chi-chi" tail loop).
+#define BUF_FRAMES  4096
+
 void audio_init(void);
 void audio_play_sine(void);
 void audio_stop(void);

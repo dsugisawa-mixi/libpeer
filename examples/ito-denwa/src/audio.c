@@ -20,11 +20,12 @@
 // carrying the 16-bit sample with 1 delay bit + 15 padding bits as required
 // by Philips I2S). So a ring of N stereo frames needs 2*N words.
 //
-// 32KB ring (4096 stereo frames × 2 words × 4 bytes) → ~170ms @ 24kHz.
+// 32KB ring (BUF_FRAMES stereo frames × 2 words × 4 bytes) → ~170ms @ 24kHz.
+// BUF_FRAMES is exposed via audio.h so streaming clients can size their
+// end-of-stream silence pad to a full ring lap.
 // Buffer must be aligned to its size for the DMA ring wrap trick.
 // RP2350 channel_config_set_ring upper bound is 15 bits (32KB) in practice;
 // 16 bits silently broke the wrap and produced full silence in earlier tests.
-#define BUF_FRAMES      4096
 #define BUF_WORDS       (BUF_FRAMES * 2)        // 8192 uint32 words
 #define BUF_BYTES       (BUF_WORDS * 4)         // 32 KB
 #define BUF_RING_BITS   15                      // log2(BUF_BYTES)

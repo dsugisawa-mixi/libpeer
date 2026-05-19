@@ -18,16 +18,20 @@
 #include "lwip/ip_addr.h"
 
 #define HTTPS_PORT          443
-// Response body sizing — kept tight (64 KB) because:
+// Response body sizing:
 //   - HM_INFO uses /api/tunnel/info?t=simple, which omits recent_additions
 //     and returns just operators[]/lab_ids → a few KB at most.
 //   - HM_TIMELINE returns a JSON array of timeline items and can grow
 //     several tens of KB; 16 KB was too small here, 64 KB has headroom.
-//   - HM_TTS is chunked + compacted in-place by tts_resp_compact every
-//     TTS_COMPACT_THRESHOLD bytes, so its high-water-mark stays under ~4 KB.
-// recv_cb has ERR_MEM backpressure if the buffer ever fills (it won't in
-// normal operation), so the bound is hard-safe rather than just optimistic.
-#define RESP_BUF_SIZE       (64 * 1024)
+//   - HM_TTS is chunked, and chunk-bursts from the API are followed by
+//     1–2 s server pauses while the next chunk is generated. We must hold
+//     enough decoded PCM to drain across those pauses or the audio ring
+//     underruns; 128 KB buys ~2.6 s @ 24 kHz mono int16. Bigger than this
+//     starts squeezing the newlib heap that mbedtls' TLS handshake uses
+//     (~+188 KB BSS total has been observed to OOM altcp_tls_new).
+// recv_cb has ERR_MEM backpressure if the buffer ever fills (real for
+// TTS — see above), so the bound is hard-safe.
+#define RESP_BUF_SIZE       (128 * 1024)
 // Big enough for HTTP POST headers + a few KB of UTF-8 message body.
 #define REQ_BUF_SIZE        4096
 #define HTTPS_TIMEOUT_MS    20000
