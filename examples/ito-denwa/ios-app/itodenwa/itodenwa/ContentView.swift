@@ -5,6 +5,7 @@ struct ContentView: View {
     @State private var ssid = "mx-free24"
     @State private var password = "ckuv7482"
     @State private var deviceID = "aaaa"
+    @State private var opusEnabled = false
 
     var body: some View {
         NavigationView {
@@ -40,18 +41,26 @@ struct ContentView: View {
                     }
                     .disabled(ble.state != .ready)
 
+                    Section("Codec") {
+                        Toggle("Opus (lower bandwidth)", isOn: $opusEnabled)
+                    }
+                    .disabled(ble.state != .ready)
+
                     Section("Progress") {
                         checkRow("BLE Connected", done: isConnected)
                         checkRow("SSID Written", done: ble.ssidOK)
                         checkRow("Password Written", done: ble.passOK)
                         checkRow("Device ID Written", done: ble.devidOK)
+                        checkRow("Opus Written", done: ble.opusOK)
                         checkRow("Saved to Flash", done: ble.commitDone)
                     }
 
                     Section {
                         if ble.state == .ready {
                             Button("Provision") {
-                                ble.provision(ssid: ssid, password: password, deviceID: deviceID)
+                                ble.provision(ssid: ssid, password: password,
+                                              deviceID: deviceID,
+                                              opusEnabled: opusEnabled)
                             }
                             .disabled(ssid.isEmpty || password.isEmpty || deviceID.isEmpty)
                         } else if ble.state == .saved {
@@ -62,13 +71,14 @@ struct ContentView: View {
                                 ssid = ""
                                 password = ""
                                 deviceID = ""
+                                opusEnabled = false
                                 ble.disconnect()
                             }
                         }
                     }
                 }
             }
-            .navigationTitle("Ito-Denwa Setup")
+            .navigationTitle("Device Setup")
         }
         .navigationViewStyle(.stack)
     }

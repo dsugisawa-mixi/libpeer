@@ -23,6 +23,7 @@ private enum DeviceStatus: UInt8 {
     case passOK  = 0x02
     case devidOK = 0x03
     case saved   = 0x04
+    case opusOK  = 0x05
     case error   = 0xFF
 }
 
@@ -36,6 +37,7 @@ final class BluetoothProvisionManager: NSObject, ObservableObject {
     private let commitUUID  = CBUUID(string: "A2D40003-2D11-1AE1-2D80-1A30CCAE0001")
     private let statusUUID  = CBUUID(string: "A2D40004-2D11-1AE1-2D80-1A30CCAE0001")
     private let devidUUID   = CBUUID(string: "A2D40005-2D11-1AE1-2D80-1A30CCAE0001")
+    private let opusUUID    = CBUUID(string: "A2D40006-2D11-1AE1-2D80-1A30CCAE0001")
 
     // MARK: - Published state
 
@@ -43,6 +45,7 @@ final class BluetoothProvisionManager: NSObject, ObservableObject {
     @Published var ssidOK = false
     @Published var passOK = false
     @Published var devidOK = false
+    @Published var opusOK = false
     @Published var commitDone = false
     @Published var lastError = ""
 
@@ -55,6 +58,7 @@ final class BluetoothProvisionManager: NSObject, ObservableObject {
     private var commitChar: CBCharacteristic?
     private var statusChar: CBCharacteristic?
     private var devidChar: CBCharacteristic?
+    private var opusChar: CBCharacteristic?
 
     // MARK: - Provisioning queue
 
@@ -83,21 +87,22 @@ final class BluetoothProvisionManager: NSObject, ObservableObject {
         central.scanForPeripherals(withServices: [serviceUUID], options: nil)
     }
 
-    func provision(ssid: String, password: String, deviceID: String) {
+    func provision(ssid: String, password: String, deviceID: String, opusEnabled: Bool) {
         guard state == .ready,
-              let ssidChar, let passChar, let devidChar, let commitChar else { return }
+              let ssidChar, let passChar, let devidChar, let opusChar, let commitChar else { return }
 
         pendingSSID = ssid
         pendingPassword = password
         pendingDeviceID = deviceID
         state = .provisioning
 
-        // Build write queue: SSID → Password → DeviceID → Commit
+        // Build write queue: SSID → Password → DeviceID → Opus → Commit
         writeQueue = [
-            (Data(ssid.utf8),      ssidChar,   .ssidOK),
-            (Data(password.utf8),  passChar,   .passOK),
-            (Data(deviceID.utf8),  devidChar,  .devidOK),
-            (Data([0x01]),         commitChar, .saved),
+            (Data(ssid.utf8),                    ssidChar,   .ssidOK),
+            (Data(password.utf8),                passChar,   .passOK),
+            (Data(deviceID.utf8),                devidChar,  .devidOK),
+            (Data([opusEnabled ? 0x01 : 0x00]),  opusChar,   .opusOK),
+            (Data([0x01]),                       commitChar, .saved),
         ]
         retryCount = 0
         sendNext()
@@ -164,6 +169,7 @@ final class BluetoothProvisionManager: NSObject, ObservableObject {
         case .ssidOK:  ssidOK = true
         case .passOK:  passOK = true
         case .devidOK: devidOK = true
+        case .opusOK:  opusOK = true
         case .saved:   commitDone = true; state = .saved
         default: break
         }
@@ -180,6 +186,7 @@ final class BluetoothProvisionManager: NSObject, ObservableObject {
         ssidOK = false
         passOK = false
         devidOK = false
+        opusOK = false
         commitDone = false
         lastError = ""
         writeQueue.removeAll()
@@ -189,6 +196,7 @@ final class BluetoothProvisionManager: NSObject, ObservableObject {
         commitChar = nil
         statusChar = nil
         devidChar = nil
+        opusChar = nil
     }
 }
 
@@ -260,6 +268,7 @@ extension BluetoothProvisionManager: CBPeripheralDelegate {
             case passUUID:   passChar = c
             case commitUUID: commitChar = c
             case devidUUID:  devidChar = c
+            case opusUUID:   opusChar = c
             case statusUUID:
                 statusChar = c
                 peripheral.setNotifyValue(true, for: c)
@@ -273,6 +282,7 @@ extension BluetoothProvisionManager: CBPeripheralDelegate {
         if commitChar == nil { missing.append("Commit") }
         if statusChar == nil { missing.append("Status") }
         if devidChar == nil  { missing.append("DevID") }
+        if opusChar == nil   { missing.append("Opus") }
 
         if missing.isEmpty {
             state = .ready
