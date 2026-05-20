@@ -15,7 +15,7 @@
 // Bump when on-flash layout changes — a mismatch makes creds_load() return
 // "no creds" so the device falls back to BLE provisioning mode instead of
 // reading stale fields at the wrong offsets.
-#define CREDS_VERSION  2u
+#define CREDS_VERSION  3u
 
 // One sector at the very top of flash.
 #define CREDS_FLASH_OFFSET   (PICO_FLASH_SIZE_BYTES - FLASH_SECTOR_SIZE)
@@ -27,7 +27,7 @@ typedef struct __attribute__((packed)) {
     uint8_t  ssid_len;
     uint8_t  pass_len;
     uint8_t  device_id_len;
-    uint8_t  _pad[1];
+    uint8_t  opus_enabled;       // 0 = off, non-zero = on
     char     ssid[CREDS_SSID_MAX];
     char     password[CREDS_PASS_MAX];
     char     device_id[CREDS_DEVICE_ID_MAX];
@@ -96,8 +96,9 @@ int creds_load(wifi_creds_t *out) {
     out->ssid[r.ssid_len]           = '\0';
     out->password[r.pass_len]       = '\0';
     out->device_id[r.device_id_len] = '\0';
-    printf("[creds] loaded SSID='%s' (pass_len=%u) device_id='%s'\n",
-           out->ssid, r.pass_len, out->device_id);
+    out->opus_enabled               = (r.opus_enabled != 0);
+    printf("[creds] loaded SSID='%s' (pass_len=%u) device_id='%s' opus=%d\n",
+           out->ssid, r.pass_len, out->device_id, (int)out->opus_enabled);
     return 0;
 }
 
@@ -134,6 +135,7 @@ int creds_save(const wifi_creds_t *in) {
     ctx.record.ssid_len      = (uint8_t)slen;
     ctx.record.pass_len      = (uint8_t)plen;
     ctx.record.device_id_len = (uint8_t)dlen;
+    ctx.record.opus_enabled  = in->opus_enabled ? 1u : 0u;
     memcpy(ctx.record.ssid,      in->ssid,      slen);
     memcpy(ctx.record.password,  in->password,  plen);
     memcpy(ctx.record.device_id, in->device_id, dlen);
@@ -149,8 +151,8 @@ int creds_save(const wifi_creds_t *in) {
         printf("[creds] flash_safe_execute failed rc=%d\n", rc);
         return -1;
     }
-    printf("[creds] saved SSID='%s' (pass_len=%u) device_id='%s'\n",
-           in->ssid, (unsigned)plen, in->device_id);
+    printf("[creds] saved SSID='%s' (pass_len=%u) device_id='%s' opus=%d\n",
+           in->ssid, (unsigned)plen, in->device_id, (int)in->opus_enabled);
     return ctx.result;
 }
 

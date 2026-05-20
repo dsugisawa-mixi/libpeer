@@ -178,7 +178,8 @@ static void on_core1_running(void) {
             printf("[core1] POST tts (queue=%d gender=%s)\n",
                    tts_queue_count(), gender ? gender : "(default)");
             if (tts_kick_request(msg, gender, &g_api_ip, g_https_host,
-                                 g_wifi_creds.device_id) != 0) {
+                                 g_wifi_creds.device_id,
+                                 g_wifi_creds.opus_enabled) != 0) {
                 tts_queue_pop();
                 http_set_state(HC_DONE_ERR);
             }

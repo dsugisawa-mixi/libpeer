@@ -34,7 +34,7 @@ void tts_send_end_if_needed(void);
 #include "lwip/ip_addr.h"
 int tts_kick_request(const char *message, const char *gender,
                      const ip_addr_t *ip, const char *host,
-                     const char *device_id);
+                     const char *device_id, bool opus_enabled);
 
 // Core0: drain g_core0_pcm_pending into the audio ring.
 // Returns true while playback is in flight.

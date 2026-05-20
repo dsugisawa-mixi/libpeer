@@ -10,6 +10,7 @@
 #include "ic_ring.h"
 #include "queue.h"
 #include "gui.h"      // g_tts_play_active
+#include "opus_stream.h"
 
 #define TTS_PATH  "/api/tts/generate_stream"
 
@@ -48,6 +49,7 @@ void tts_start_playback(void) {
     }
     audio_set_sample_rate(g_tts_sample_rate);
     audio_stream_reset();
+    opus_stream_reset();
     g_tts_play_pos      = 0;
     g_tts_pad_remaining = 0;
     g_core0_pcm_pending_len  = 0;
@@ -101,7 +103,7 @@ static int json_escape(char *dst, size_t dst_sz, const char *src) {
 
 int tts_kick_request(const char *message, const char *gender,
                      const ip_addr_t *ip, const char *host,
-                     const char *device_id) {
+                     const char *device_id, bool opus_enabled) {
     g_https_mode = HM_TTS;
 
     char body[TTS_MSG_LEN * 2 + 96];
@@ -113,8 +115,8 @@ int tts_kick_request(const char *message, const char *gender,
     const char *g = (gender && *gender) ? gender : "male";
     int blen = snprintf(body, sizeof(body),
                         "{\"gender\":\"%s\",\"style\":\"neutral\","
-                        "\"out_lang\":\"ja\",\"text\":\"%s\"}",
-                        g, escaped);
+                        "\"out_lang\":\"ja\",\"opus\":%s,\"text\":\"%s\"}",
+                        g, opus_enabled ? "true" : "false", escaped);
     if (blen < 0 || (size_t)blen >= sizeof(body)) {
         printf("[tts] body overflow\n");
         return -1;
@@ -195,8 +197,19 @@ bool tts_play_pump(void) {
 }
 
 //=============================================================================
-// Core1: PCM forwarder (g_https_resp → IC ring → core0)
+// Core1: opus stream decoder + PCM forwarder
+//
+// Body framing (server emits when request JSON has "opus": true):
+//   for each 20ms frame: [u16 BE length L][L bytes opus packet]
+// Each frame decodes to OPUS_STREAM_FRAME_SAMPLES (480) int16 mono samples
+// = 960 PCM bytes, shipped as one IC_MSG_TTS_PCM_CHUNK to core0.
+//
+// Bound work per call to keep lwIP poll cadence responsive — opus_decode on
+// RP2350 M33 + FPU at 153.6 MHz is ~1 ms per frame, so a handful of frames
+// per iteration is comfortably under the lwIP poll budget.
 //=============================================================================
+#define TTS_FWD_MAX_FRAMES_PER_PASS  4
+
 bool tts_forward_pump(void) {
     if (!g_tts_play_active)       return false;
     if (g_core1_tts_end_sent)     return false;
@@ -207,26 +220,75 @@ bool tts_forward_pump(void) {
     size_t body_have = g_https_chunked
                          ? g_chunked_write_pos
                          : (g_https_resp_len - g_https_body_start);
-    size_t bytes_left = body_have - g_tts_play_pos;
 
-    if (bytes_left >= 2) {
-        size_t n = bytes_left;
-        if (n > TTS_FWD_CHUNK_SIZE) n = TTS_FWD_CHUNK_SIZE;
-        n &= ~1u;
+    if (g_https_body_opus) {
+        const uint8_t *body = (const uint8_t *)g_https_resp + g_https_body_start;
+        int frames_decoded = 0;
+        size_t pcm_bytes_shipped = 0;
+        while (frames_decoded < TTS_FWD_MAX_FRAMES_PER_PASS
+               && g_tts_play_pos + 2 <= body_have) {
+            uint16_t L = ((uint16_t)body[g_tts_play_pos]     << 8)
+                       |  (uint16_t)body[g_tts_play_pos + 1];
 
-        const uint8_t *src = (const uint8_t *)g_https_resp + g_https_body_start
-                             + g_tts_play_pos;
-        ic_send(IC_MSG_TTS_PCM_CHUNK, src, (uint16_t)n);
-        g_tts_play_pos += n;
+            if (L == 0 || L > OPUS_STREAM_MAX_PACKET) {
+                // Either zero-length (server-side framing bug) or absurd —
+                // treat as a fatal framing desync. Drop the rest of the body
+                // and end playback so we don't loop forever decoding garbage.
+                printf("[tts/opus] bad packet length=%u at pos=%u — abort\n",
+                       (unsigned)L, (unsigned)g_tts_play_pos);
+                g_tts_play_pos = body_have;
+                break;
+            }
+            if (g_tts_play_pos + 2 + L > body_have) break;  // incomplete
 
-        tts_resp_compact();
+            int16_t pcm[OPUS_STREAM_FRAME_SAMPLES];
+            int nsamples = opus_stream_decode_frame(
+                body + g_tts_play_pos + 2, L,
+                pcm, OPUS_STREAM_FRAME_SAMPLES);
+            g_tts_play_pos += 2u + L;
 
-        static uint32_t last_log = 0;
+            if (nsamples > 0) {
+                size_t nbytes = (size_t)nsamples * sizeof(int16_t);
+                ic_send(IC_MSG_TTS_PCM_CHUNK, (const uint8_t *)pcm, (uint16_t)nbytes);
+                pcm_bytes_shipped += nbytes;
+            }
+            frames_decoded++;
+        }
+
+        if (frames_decoded > 0) tts_resp_compact();
+
+        static uint32_t last_log_opus = 0;
         uint32_t now = board_millis();
-        if ((now - last_log) >= 250) {
-            last_log = now;
-            printf("[tts] fwd pos=%u/%u (+%u bytes)\n",
-                   (unsigned)g_tts_play_pos, (unsigned)body_have, (unsigned)n);
+        if (frames_decoded > 0 && (now - last_log_opus) >= 250) {
+            last_log_opus = now;
+            printf("[tts/opus] fwd pos=%u/%u (+%d frames, +%u PCM bytes)\n",
+                   (unsigned)g_tts_play_pos, (unsigned)body_have,
+                   frames_decoded, (unsigned)pcm_bytes_shipped);
+        }
+    } else {
+        // Raw-PCM forwarder (server sends int16 mono PCM verbatim — opus=false
+        // in the request JSON). Forward up to one IC payload per pass; the IC
+        // ring's depth handles burst-vs-drain skew.
+        size_t bytes_left = body_have - g_tts_play_pos;
+        if (bytes_left >= 2) {
+            size_t n = bytes_left;
+            if (n > TTS_FWD_CHUNK_SIZE) n = TTS_FWD_CHUNK_SIZE;
+            n &= ~1u;
+
+            const uint8_t *src = (const uint8_t *)g_https_resp
+                                 + g_https_body_start + g_tts_play_pos;
+            ic_send(IC_MSG_TTS_PCM_CHUNK, src, (uint16_t)n);
+            g_tts_play_pos += n;
+
+            tts_resp_compact();
+
+            static uint32_t last_log_pcm = 0;
+            uint32_t now = board_millis();
+            if ((now - last_log_pcm) >= 250) {
+                last_log_pcm = now;
+                printf("[tts/pcm] fwd pos=%u/%u (+%u bytes)\n",
+                       (unsigned)g_tts_play_pos, (unsigned)body_have, (unsigned)n);
+            }
         }
     }
 
@@ -236,7 +298,9 @@ bool tts_forward_pump(void) {
     bool source_drained = (body_have - g_tts_play_pos) < 2;
 
     if (stream_done && source_drained) {
-        printf("[tts] fwd done: %u bytes forwarded\n", (unsigned)g_tts_play_pos);
+        printf("[tts/%s] fwd done: %u body bytes consumed\n",
+               g_https_body_opus ? "opus" : "pcm",
+               (unsigned)g_tts_play_pos);
         ic_send(IC_MSG_TTS_END, NULL, 0);
         g_core1_tts_end_sent = true;
         return false;

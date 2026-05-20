@@ -5,6 +5,7 @@ SET(PICO_BOARD pico2_w)
 SET(HOME $ENV{HOME})
 SET(PICO_SDK_FETCH_FROM_GIT on)
 INCLUDE(pico_sdk_import.cmake)
+INCLUDE(opus_import.cmake)
 
 PROJECT(${PRJ} C CXX ASM)
 SET(CMAKE_C_STANDARD 11)
@@ -44,6 +45,9 @@ IF (PICO_SDK_VERSION_STRING VERSION_LESS "1.3.0")
 ENDIF()
 SET(CMAKE_INCLUDE_CURRENT_DIR ON)
 
+set(OPUS_FIXED_POINT ON CACHE BOOL "OPUS_FIXED_POINT")
+add_subdirectory(${OPUS_PATH} build/opus)
+
 INCLUDE_DIRECTORIES(".")
 
 INCLUDE_DIRECTORIES(
@@ -66,6 +70,7 @@ ADD_EXECUTABLE(
     ${CMAKE_CURRENT_LIST_DIR}/../src/wifi.c
     ${CMAKE_CURRENT_LIST_DIR}/../src/gui.c
     ${CMAKE_CURRENT_LIST_DIR}/../src/tts.c
+    ${CMAKE_CURRENT_LIST_DIR}/../src/opus_stream.c
     ${CMAKE_CURRENT_LIST_DIR}/../src/credentials.c
     ${CMAKE_CURRENT_LIST_DIR}/../src/ble_provision.c
     ${CMAKE_CURRENT_LIST_DIR}/../main.c
@@ -101,6 +106,7 @@ TARGET_LINK_LIBRARIES(
     # BLE for first-boot WiFi provisioning
     pico_btstack_ble
     pico_btstack_cyw43
+    opus
 )
 
 pico_enable_stdio_usb(${PRJ} 0)

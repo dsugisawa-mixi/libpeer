@@ -30,6 +30,7 @@ typedef enum {
     PROV_STATUS_PASS_OK  = 2,
     PROV_STATUS_DEVID_OK = 3,
     PROV_STATUS_SAVED    = 4,
+    PROV_STATUS_OPUS_OK  = 5,
     PROV_STATUS_ERR      = 0xFF,
 } prov_status_t;
 
@@ -86,6 +87,9 @@ static void render_prov_view(void) {
     lcd_draw_text(8, y, has_devid ? "[*] Device ID set" : "[ ] Device ID set",
                   2, has_devid ? COLOR_GREEN : COLOR_GRAY, COLOR_BLACK);
     y += 22;
+    lcd_draw_text(8, y, g_pending.opus_enabled ? "[*] Opus: ON" : "[ ] Opus: OFF",
+                  2, g_pending.opus_enabled ? COLOR_GREEN : COLOR_GRAY, COLOR_BLACK);
+    y += 22;
     bool committed = (g_prov_state == PROV_COMMITTED);
     lcd_draw_text(8, y, committed ? "[*] Committed" : "[ ] Commit",
                   2, committed ? COLOR_GREEN : COLOR_GRAY, COLOR_BLACK);
@@ -138,6 +142,7 @@ static const uint8_t scan_response_data_len = sizeof(scan_response_data);
 #define H_STATUS_CCCD \
     ATT_CHARACTERISTIC_A2D40004_2D11_1AE1_2D80_1A30CCAE0001_01_CLIENT_CONFIGURATION_HANDLE
 #define H_DEVID   ATT_CHARACTERISTIC_A2D40005_2D11_1AE1_2D80_1A30CCAE0001_01_VALUE_HANDLE
+#define H_OPUS    ATT_CHARACTERISTIC_A2D40006_2D11_1AE1_2D80_1A30CCAE0001_01_VALUE_HANDLE
 
 //=============================================================================
 // Notification helper.
@@ -251,6 +256,14 @@ static int att_write_cb(hci_con_handle_t con, uint16_t att_handle,
         prov_ui_dirty();
         return 0;
     }
+    if (att_handle == H_OPUS) {
+        if (buffer_size < 1) return ATT_ERROR_VALUE_NOT_ALLOWED;
+        g_pending.opus_enabled = (buffer[0] != 0);
+        printf("[ble] Opus written: %d\n", (int)g_pending.opus_enabled);
+        notify_status(PROV_STATUS_OPUS_OK);
+        prov_ui_dirty();
+        return 0;
+    }
     if (att_handle == H_COMMIT) {
         if (buffer_size < 1) return ATT_ERROR_VALUE_NOT_ALLOWED;
         if (buffer[0] != 0x01) return 0;  // only 0x01 triggers commit
@@ -332,6 +345,10 @@ int ble_provision_run(wifi_creds_t *out, uint32_t timeout_ms) {
     if (!out) return -1;
 
     memset(&g_pending, 0, sizeof(g_pending));
+    // Default Opus to OFF so the device stays on the known-working raw-PCM
+    // path unless the phone explicitly opts in. Phones that don't yet know
+    // about the v3 schema will leave this at 0 and keep working.
+    g_pending.opus_enabled = false;
     g_connected   = false;
     g_prov_state  = PROV_RUNNING;
     g_prov_status = PROV_STATUS_IDLE;

@@ -37,6 +37,7 @@ typedef struct {
     char    ssid[CREDS_SSID_MAX + 1];           // +1 for guaranteed NUL terminator
     char    password[CREDS_PASS_MAX + 1];
     char    device_id[CREDS_DEVICE_ID_MAX + 1];
+    bool    opus_enabled;                       // true → request opus codec on TTS
 } wifi_creds_t;
 
 // Returns 0 if a valid, CRC-verified set of creds was loaded into *out.

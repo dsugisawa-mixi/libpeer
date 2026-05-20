@@ -38,6 +38,7 @@ volatile int           g_https_content_len  = -1;
 volatile uint32_t      g_tts_sample_rate    = 24000;
 
 bool          g_https_chunked     = false;
+bool          g_https_body_opus   = false;
 size_t        g_chunked_read_pos  = 0;
 size_t        g_chunked_write_pos = 0;
 chunk_state_t g_chunked_state     = CHUNK_NEED_SIZE;
@@ -287,7 +288,10 @@ void http_apply_tts_headers(void) {
     g_tts_sample_rate = hz;
     const char *te = http_find_header(g_https_resp, g_https_body_start, "Transfer-Encoding");
     g_https_chunked = (te && strncasecmp(te, "chunked", 7) == 0);
-    printf("[tts] sample_rate=%u chunked=%d\n", (unsigned)hz, (int)g_https_chunked);
+    const char *ct = http_find_header(g_https_resp, g_https_body_start, "Content-Type");
+    g_https_body_opus = (ct && strncasecmp(ct, "audio/opus", 10) == 0);
+    printf("[tts] sample_rate=%u chunked=%d opus=%d\n",
+           (unsigned)hz, (int)g_https_chunked, (int)g_https_body_opus);
 }
 
 void http_resp_compact_locked(void) {
@@ -345,12 +349,29 @@ static void http_check_complete(void) {
             http_apply_tts_headers();
         }
     }
-    // Per-arrival: arm TTS playback once enough raw body has buffered so
-    // the DMA ring isn't drained dry by the I2S engine before the forward
-    // pump can fill it. Fallback arming (response finished below
-    // prebuffer) is handled in https_handle_done.
+    // Opus-only: eagerly run the chunked decoder before playback is armed.
+    // For PCM, forward_pump (core1) runs the chunked decoder after arming,
+    // and PCM bodies are always large enough to hit TTS_PREBUFFER_BYTES on
+    // raw bytes. For opus, the entire utterance can be < 8 KB (24 kbps),
+    // and HC_DONE_OK only fires when the chunked decoder sees the 0-chunk
+    // terminator. Without eager decoding here, short opus utterances stall
+    // until the poll timeout. Gated on !g_tts_play_active so forward_pump
+    // is the sole driver once arming completes.
+    if (g_https_headers_done && g_https_body_opus && g_https_chunked
+        && !g_tts_play_active) {
+        http_chunked_decode_in_place();
+    }
+
+    // Per-arrival: arm TTS playback once enough body has buffered so the
+    // DMA ring isn't drained dry by the I2S engine before the forward pump
+    // can fill it. Fallback arming (response finished below prebuffer) is
+    // handled in https_handle_done. PCM uses raw bytes (existing behavior);
+    // opus uses decoded chunked bytes so a short response below the raw
+    // threshold still arms once enough opus packets are buffered.
     if (g_https_headers_done && g_https_mode == HM_TTS && !g_tts_play_active) {
-        size_t body_have = g_https_resp_len - g_https_body_start;
+        size_t body_have = g_https_body_opus
+                             ? g_chunked_write_pos
+                             : (g_https_resp_len - g_https_body_start);
         if (body_have >= TTS_PREBUFFER_BYTES) {
             tts_start_playback();
         }
@@ -511,6 +532,7 @@ int http_request_start(const ip_addr_t *ip, const char *host) {
     g_https_content_len  = -1;
     g_tts_sample_rate    = 24000;
     g_https_chunked      = false;
+    g_https_body_opus    = false;
     g_chunked_read_pos   = 0;
     g_chunked_write_pos  = 0;
     g_chunked_state      = CHUNK_NEED_SIZE;
