@@ -108,20 +108,30 @@ static int json_escape(char *dst, size_t dst_sz, const char *src) {
 
 int tts_kick_request(const char *message, const char *gender,
                      const ip_addr_t *ip, const char *host,
-                     const char *device_id, bool opus_enabled) {
+                     const char *device_id, bool opus_enabled,
+                     const char *operator_id) {
     g_https_mode = HM_TTS;
 
-    char body[TTS_MSG_LEN * 2 + 96];
+    char body[TTS_MSG_LEN * 2 + 192];
     char escaped[TTS_MSG_LEN * 2];
     if (json_escape(escaped, sizeof(escaped), message) < 0) {
         printf("[tts] escape overflow\n");
         return -1;
     }
     const char *g = (gender && *gender) ? gender : "male";
+    // Optional "operator_id" segment — only emitted when the caller
+    // hands us a non-empty id. Server uses it to lock TTS routing to
+    // that operator and stop the radio operator from hijacking the
+    // response when one is registered for this device.
+    char op_seg[MAX_LAB_ID_LEN + 32] = "";
+    if (operator_id && operator_id[0]) {
+        snprintf(op_seg, sizeof(op_seg),
+                 "\"operator_id\":\"%s\",", operator_id);
+    }
     int blen = snprintf(body, sizeof(body),
-                        "{\"gender\":\"%s\",\"style\":\"neutral\","
+                        "{%s\"gender\":\"%s\",\"style\":\"neutral\","
                         "\"out_lang\":\"ja\",\"opus\":%s,\"text\":\"%s\"}",
-                        g, opus_enabled ? "true" : "false", escaped);
+                        op_seg, g, opus_enabled ? "true" : "false", escaped);
     if (blen < 0 || (size_t)blen >= sizeof(body)) {
         printf("[tts] body overflow\n");
         return -1;
@@ -291,9 +301,10 @@ bool tts_forward_pump(void) {
                 // forever and audio underruns continuously. Dump the
                 // surrounding bytes (one-shot) and force-abort so playback
                 // finalizes the partial audio we already shipped.
-                bool stream_final = g_https_chunked
-                                      ? (g_chunked_state == CHUNK_DONE)
-                                      : (g_https_state == HC_IDLE);
+                bool stream_final = (g_https_state == HC_IDLE)
+                                    || (g_https_chunked
+                                          ? (g_chunked_state == CHUNK_DONE)
+                                          : false);
                 if (stream_final) {
                     static bool dumped = false;
                     if (!dumped) {
@@ -381,9 +392,16 @@ bool tts_forward_pump(void) {
         }
     }
 
-    bool stream_done    = g_https_chunked
-                            ? (g_chunked_state == CHUNK_DONE)
-                            : (g_https_state == HC_IDLE);
+    // HC_IDLE means the transport is gone (TCP FIN or RADIO_STOP →
+    // http_cleanup). Treat that as "no more body bytes coming" even
+    // for chunked responses — radio streams never reach CHUNK_DONE
+    // because the user-side stop tears down the pcb mid-stream, so
+    // without this check the forward pump would wait forever and
+    // never ship TTS_END, leaving g_tts_play_active stuck on.
+    bool stream_done    = (g_https_state == HC_IDLE)
+                          || (g_https_chunked
+                                ? (g_chunked_state == CHUNK_DONE)
+                                : false);
     bool source_drained = (body_have - g_tts_play_pos) < 2;
 
     if (stream_done && source_drained) {

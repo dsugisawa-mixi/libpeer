@@ -14,11 +14,9 @@
 //=============================================================================
 volatile view_state_t g_view = VIEW_STATUS;
 volatile lab_state_t  g_lab_state    = LAB_IDLE;
-char     g_operator_ids[MAX_LABS][MAX_LAB_ID_LEN];
-char     g_lab_ids[MAX_LABS][MAX_LAB_ID_LEN];
-bool     g_lab_is_radio[MAX_LABS];
-int      g_lab_count    = 0;
-int      g_lab_selected = 0;
+lab_entry_t g_labs[MAX_LABS];
+int         g_lab_count    = 0;
+int         g_lab_selected = 0;
 
 bool          g_timeline_active    = false;
 char          g_timeline_lab_id[MAX_LAB_ID_LEN] = "";
@@ -157,7 +155,7 @@ void render_lab_list(void) {
             : COLOR_BLACK;
         uint16_t fg = sel ? COLOR_BLACK : COLOR_WHITE;
         lcd_fill_rect(0, y, LCD_W, ROW_H - 2, bg);
-        lcd_draw_text(TEXT_X, y + 3, g_lab_ids[i], FONT_SCALE, fg, bg);
+        lcd_draw_text(TEXT_X, y + 3, g_labs[i].lab_id, FONT_SCALE, fg, bg);
     }
 }
 
@@ -226,8 +224,8 @@ static void on_button_event(int idx, bool now_pressed) {
             break;
         case GUI_KEY_CTRL:
             if (g_view == VIEW_LABS && g_lab_state == LAB_OK && g_lab_count > 0) {
-                bool radio = g_lab_is_radio[g_lab_selected];
-                if (radio) {
+                const lab_entry_t *sel = &g_labs[g_lab_selected];
+                if (sel->is_radio) {
                     // Re-press while a radio stream is playing → stop it. We
                     // use g_tts_play_active as the "stream live" signal
                     // because tts_start_playback flips it on once headers
@@ -236,14 +234,21 @@ static void on_button_event(int idx, bool now_pressed) {
                         ic_send(IC_MSG_RADIO_STOP, NULL, 0);
                         printf("[core0] Enter: stop radio\n");
                     } else {
-                        ic_send(IC_MSG_RADIO_START, NULL, 0);
+                        // Ship the radio operator's id with the start
+                        // signal so core1 can pin the request body to
+                        // it. Without this the server's default routing
+                        // hijacks the response into a gameserver TTS
+                        // when one is registered for this device.
+                        ic_send(IC_MSG_RADIO_START,
+                                sel->operator_id,
+                                (uint16_t)strlen(sel->operator_id));
                         printf("[core0] Enter: start radio op=%s\n",
-                               g_operator_ids[g_lab_selected]);
+                               sel->operator_id);
                     }
                 } else if (!g_timeline_active) {
-                    strncpy(g_timeline_lab_id, g_lab_ids[g_lab_selected], MAX_LAB_ID_LEN - 1);
+                    strncpy(g_timeline_lab_id, sel->lab_id, MAX_LAB_ID_LEN - 1);
                     g_timeline_lab_id[MAX_LAB_ID_LEN - 1] = '\0';
-                    const char *op = g_operator_ids[g_lab_selected];
+                    const char *op = sel->operator_id;
                     ic_send(IC_MSG_TIMELINE_START, op, (uint16_t)strlen(op));
                     g_timeline_active = true;
                     printf("[core0] Enter: start timeline for lab=%s\n", g_timeline_lab_id);

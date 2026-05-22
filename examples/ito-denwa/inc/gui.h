@@ -45,11 +45,19 @@ typedef enum {
 // Shared state — defined in gui.c, read/written from main.c core loops.
 extern volatile view_state_t g_view;
 extern volatile lab_state_t  g_lab_state;
-extern char     g_operator_ids[MAX_LABS][MAX_LAB_ID_LEN];
-extern char     g_lab_ids[MAX_LABS][MAX_LAB_ID_LEN];
-extern bool     g_lab_is_radio[MAX_LABS];
-extern int      g_lab_count;
-extern int      g_lab_selected;
+// One row per operator/lab pair surfaced by /api/tunnel/info. Roles
+// drive Enter-key behavior on the lab list (radio = streaming pcb path,
+// gameserver = (future) auto-target path, else = manual timeline).
+typedef struct lab_entry {
+    char operator_id[MAX_LAB_ID_LEN];
+    char lab_id[MAX_LAB_ID_LEN];
+    bool is_radio;
+    bool is_gameserver;
+} lab_entry_t, *lab_entry_ptr;
+
+extern lab_entry_t g_labs[MAX_LABS];
+extern int         g_lab_count;
+extern int         g_lab_selected;
 extern bool     g_timeline_active;
 extern char     g_timeline_lab_id[MAX_LAB_ID_LEN];
 extern volatile int  g_timeline_status_ver;

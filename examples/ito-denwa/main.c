@@ -90,7 +90,13 @@ static uint8_t g_core1_recv_buf[IC_RECV_BUF_BYTES];
 static bool     g_core1_fetch_pending = false;
 static uint32_t g_timeline_last_poll  = 0;
 static bool     g_core1_tl_active     = false;
-static char     g_timeline_operator_id[MAX_LAB_ID_LEN] = "";
+// Operator id the device is currently "talking to" — captured from the
+// IC payload of whichever start signal core0 last sent (TIMELINE_START
+// or RADIO_START; the two modes are mutually exclusive). Pinned into
+// outgoing TTS/radio request bodies so the server's default routing
+// can't divert the response to another operator registered for this
+// device. Empty string means "no target chosen yet".
+static char     g_core1_current_op_id[MAX_LAB_ID_LEN] = "";
 static bool     g_core1_radio_pending = false;
 
 //=============================================================================
@@ -177,16 +183,24 @@ static void on_core1_running(void) {
         if (http_kick_info(g_wifi_creds.device_id) != 0) http_set_state(HC_DONE_ERR);
     }
 
-    // Internet-radio stream start. The server identifies radio operators by
-    // X-Device-Id, so we send the same generate_stream POST body as TTS
-    // (placeholder text); the server returns the radio stream when the
-    // device's mapped operator has role=internetradio.
+    // Internet-radio stream start. Same /api/tts/generate_stream POST
+    // as the TTS path with empty text; the server returns the radio
+    // stream when the targeted operator's role=internetradio. We pin
+    // operator_id to the lab the user pressed Enter on (captured into
+    // g_core1_current_op_id by the RADIO_START handler) — without it
+    // the server's default routing can pick any operator registered
+    // for this device and return a TTS reply instead of the radio
+    // stream.
     if (g_core1_radio_pending && !https_busy) {
         g_core1_radio_pending = false;
-        printf("[core1] POST tts (radio kick)\n");
+        const char *op = g_core1_current_op_id[0]
+                            ? g_core1_current_op_id : NULL;
+        printf("[core1] POST tts (radio kick op=%s)\n",
+               op ? op : "(none)");
         if (tts_kick_request("", NULL, &g_api_ip, g_https_host,
                              g_wifi_creds.device_id,
-                             g_wifi_creds.opus_enabled) != 0) {
+                             g_wifi_creds.opus_enabled,
+                             op) != 0) {
             http_set_state(HC_DONE_ERR);
         }
         https_busy = true;
@@ -197,11 +211,19 @@ static void on_core1_running(void) {
         const char *msg    = tts_queue_peek();
         const char *gender = tts_queue_peek_gender();
         if (msg) {
-            printf("[core1] POST tts (queue=%d gender=%s)\n",
-                   tts_queue_count(), gender ? gender : "(default)");
+            // Pin TTS to the operator we're currently polling timeline
+            // for — otherwise the server's default routing picks any
+            // operator on the device (including the radio one, which
+            // hijacks the response into a radio stream).
+            const char *op = g_core1_current_op_id[0]
+                                ? g_core1_current_op_id : NULL;
+            printf("[core1] POST tts (queue=%d gender=%s op=%s)\n",
+                   tts_queue_count(), gender ? gender : "(default)",
+                   op ? op : "(none)");
             if (tts_kick_request(msg, gender, &g_api_ip, g_https_host,
                                  g_wifi_creds.device_id,
-                                 g_wifi_creds.opus_enabled) != 0) {
+                                 g_wifi_creds.opus_enabled,
+                                 op) != 0) {
                 tts_queue_pop();
                 http_set_state(HC_DONE_ERR);
             }
@@ -216,19 +238,10 @@ static void on_core1_running(void) {
             g_timeline_last_poll = now;
             printf("[core1] GET timeline\n");
             if (http_kick_timeline(g_wifi_creds.device_id,
-                                   g_timeline_operator_id,
+                                   g_core1_current_op_id,
                                    g_last_publish_id) != 0)
                 http_set_state(HC_DONE_ERR);
         }
-    }
-
-    // Debug: auto-queue one TTS after initial fetch
-    static bool s_debug_tts_sent = false;
-    if (!s_debug_tts_sent && g_lab_state == LAB_OK && !https_busy
-        && !g_tts_play_active) {
-        s_debug_tts_sent = true;
-        printf("[core1] DEBUG: auto-queueing 'こんにちは'\n");
-        tts_queue_push("こんにちは", NULL);
     }
 
     // Periodic state dump. Silenced during TTS to keep UART quiet — the
@@ -270,22 +283,27 @@ static void handle_core1_notify(ic_msg_t type, const uint8_t *payload, uint16_t 
     case IC_MSG_TIMELINE_START: {
         uint16_t n = length;
         if (n >= MAX_LAB_ID_LEN) n = MAX_LAB_ID_LEN - 1;
-        memcpy(g_timeline_operator_id, payload, n);
-        g_timeline_operator_id[n] = '\0';
+        memcpy(g_core1_current_op_id, payload, n);
+        g_core1_current_op_id[n] = '\0';
         g_last_publish_id    = -1;
         g_timeline_last_poll = 0;
         g_core1_tl_active    = true;
-        printf("[core1] TIMELINE_START operator=%s\n", g_timeline_operator_id);
+        printf("[core1] TIMELINE_START operator=%s\n", g_core1_current_op_id);
         break;
     }
     case IC_MSG_TIMELINE_STOP:
         g_core1_tl_active = false;
         printf("[core1] TIMELINE_STOP\n");
         break;
-    case IC_MSG_RADIO_START:
+    case IC_MSG_RADIO_START: {
+        uint16_t n = length;
+        if (n >= MAX_LAB_ID_LEN) n = MAX_LAB_ID_LEN - 1;
+        memcpy(g_core1_current_op_id, payload, n);
+        g_core1_current_op_id[n] = '\0';
         g_core1_radio_pending = true;
-        printf("[core1] RADIO_START queued\n");
+        printf("[core1] RADIO_START queued op=%s\n", g_core1_current_op_id);
         break;
+    }
     case IC_MSG_RADIO_STOP:
         // Tear down the in-flight TLS pcb and flag the transport idle. The
         // forward pump then sees stream_done && source_drained and ships

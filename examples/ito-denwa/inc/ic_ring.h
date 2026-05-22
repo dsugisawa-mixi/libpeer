@@ -38,7 +38,7 @@ typedef enum {
     IC_MSG_RADIO_STOP     = 0x27,  // stop in-flight radio stream
 
     // --- Core1 → Core0 status / data messages ---
-    IC_MSG_LABS_READY     = 0x30,  // labs JSON parsed, g_lab_ids[] populated
+    IC_MSG_LABS_READY     = 0x30,  // labs JSON parsed, g_labs[] populated
     IC_MSG_TTS_PCM_CHUNK  = 0x31,  // payload = raw int16-LE PCM bytes
     IC_MSG_TTS_END        = 0x32,  // no more PCM for the in-flight TTS
     IC_MSG_TTS_OPUS_PKT   = 0x33,  // payload = raw opus packet (decode on core0)

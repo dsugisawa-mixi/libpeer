@@ -1,7 +1,7 @@
 #include "http.h"
 #include "common.h"
 #include "wifi.h"    // g_api_ip
-#include "gui.h"     // g_lab_state, g_lab_ids, g_timeline_status_ver, ...
+#include "gui.h"     // g_lab_state, g_labs, g_timeline_status_ver, ...
 #include "tts.h"     // tts_start_playback, tts_send_end_if_needed
 #include "queue.h"   // tts_queue_push, tts_queue_pop
 #include "ic_ring.h" // ic_send, IC_MSG_*
@@ -170,8 +170,10 @@ static int parse_lab_response(const char *body) {
         cJSON *lab_id = cJSON_GetObjectItem(lab, "lab_id");
         cJSON *lab_name = cJSON_GetObjectItem(lab, "name");
         cJSON *role = cJSON_GetObjectItem(op, "role");
-        bool is_radio = cJSON_IsString(role) && role->valuestring
-                        && strcmp(role->valuestring, "internetradio") == 0;
+        const char *role_str = (cJSON_IsString(role) && role->valuestring)
+                                  ? role->valuestring : "";
+        bool is_radio      = strcmp(role_str, "internetradio") == 0;
+        bool is_gameserver = strcmp(role_str, "gameserver")    == 0;
         // Pick a display label: prefer lab_id, fall back to lab.name when
         // lab_id is empty (the server returns "" for radio operators).
         const char *label = NULL;
@@ -182,11 +184,13 @@ static int parse_lab_response(const char *body) {
         } else {
             continue;
         }
-        strncpy(g_operator_ids[count], op_id->valuestring,  MAX_LAB_ID_LEN - 1);
-        g_operator_ids[count][MAX_LAB_ID_LEN - 1] = '\0';
-        strncpy(g_lab_ids[count],      label,               MAX_LAB_ID_LEN - 1);
-        g_lab_ids[count][MAX_LAB_ID_LEN - 1] = '\0';
-        g_lab_is_radio[count] = is_radio;
+        lab_entry_t *e = &g_labs[count];
+        strncpy(e->operator_id, op_id->valuestring, MAX_LAB_ID_LEN - 1);
+        e->operator_id[MAX_LAB_ID_LEN - 1] = '\0';
+        strncpy(e->lab_id, label, MAX_LAB_ID_LEN - 1);
+        e->lab_id[MAX_LAB_ID_LEN - 1] = '\0';
+        e->is_radio      = is_radio;
+        e->is_gameserver = is_gameserver;
         count++;
     }
     cJSON_Delete(root);
@@ -194,8 +198,9 @@ static int parse_lab_response(const char *body) {
     g_lab_selected = 0;
     printf("[json] extracted %d operator/lab pair(s)\n", count);
     for (int i = 0; i < count; i++) {
-        printf("        [%d] op=%s lab=%s radio=%d\n",
-               i, g_operator_ids[i], g_lab_ids[i], (int)g_lab_is_radio[i]);
+        printf("        [%d] op=%s lab=%s radio=%d gameserver=%d\n",
+               i, g_labs[i].operator_id, g_labs[i].lab_id,
+               (int)g_labs[i].is_radio, (int)g_labs[i].is_gameserver);
     }
     return 0;
 }

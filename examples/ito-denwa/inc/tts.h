@@ -32,9 +32,15 @@ void tts_send_end_if_needed(void);
 // per-device UUID consumed by the API for auth (sent as X-Device-Id).
 // gender may be NULL/"" — defaults to "male".
 #include "lwip/ip_addr.h"
+// operator_id (optional, NULL or "" to omit): when present, included in
+// the request body as "operator_id" — the server uses it to target the
+// TTS at a specific operator instead of falling back to whatever default
+// it would otherwise pick (which, with a radio operator in the list,
+// hijacks the response into a radio stream).
 int tts_kick_request(const char *message, const char *gender,
                      const ip_addr_t *ip, const char *host,
-                     const char *device_id, bool opus_enabled);
+                     const char *device_id, bool opus_enabled,
+                     const char *operator_id);
 
 // Core0: drain g_core0_pcm_pending into the audio ring.
 // Returns true while playback is in flight.
