@@ -16,6 +16,7 @@ volatile view_state_t g_view = VIEW_STATUS;
 volatile lab_state_t  g_lab_state    = LAB_IDLE;
 char     g_operator_ids[MAX_LABS][MAX_LAB_ID_LEN];
 char     g_lab_ids[MAX_LABS][MAX_LAB_ID_LEN];
+bool     g_lab_is_radio[MAX_LABS];
 int      g_lab_count    = 0;
 int      g_lab_selected = 0;
 
@@ -211,21 +212,35 @@ static void on_button_event(int idx, bool now_pressed) {
             break;
         case GUI_KEY_UP:
             if (g_view == VIEW_LABS && g_lab_state == LAB_OK && g_lab_count > 0
-                && !g_timeline_active) {
+                && !g_timeline_active && !g_tts_play_active) {
                 g_lab_selected = (g_lab_selected - 1 + g_lab_count) % g_lab_count;
                 render_lab_list();
             }
             break;
         case GUI_KEY_DOWN:
             if (g_view == VIEW_LABS && g_lab_state == LAB_OK && g_lab_count > 0
-                && !g_timeline_active) {
+                && !g_timeline_active && !g_tts_play_active) {
                 g_lab_selected = (g_lab_selected + 1) % g_lab_count;
                 render_lab_list();
             }
             break;
         case GUI_KEY_CTRL:
             if (g_view == VIEW_LABS && g_lab_state == LAB_OK && g_lab_count > 0) {
-                if (!g_timeline_active) {
+                bool radio = g_lab_is_radio[g_lab_selected];
+                if (radio) {
+                    // Re-press while a radio stream is playing → stop it. We
+                    // use g_tts_play_active as the "stream live" signal
+                    // because tts_start_playback flips it on once headers
+                    // arrive, and the post-cleanup drain flips it back off.
+                    if (g_tts_play_active) {
+                        ic_send(IC_MSG_RADIO_STOP, NULL, 0);
+                        printf("[core0] Enter: stop radio\n");
+                    } else {
+                        ic_send(IC_MSG_RADIO_START, NULL, 0);
+                        printf("[core0] Enter: start radio op=%s\n",
+                               g_operator_ids[g_lab_selected]);
+                    }
+                } else if (!g_timeline_active) {
                     strncpy(g_timeline_lab_id, g_lab_ids[g_lab_selected], MAX_LAB_ID_LEN - 1);
                     g_timeline_lab_id[MAX_LAB_ID_LEN - 1] = '\0';
                     const char *op = g_operator_ids[g_lab_selected];

@@ -34,11 +34,14 @@ typedef enum {
     IC_MSG_TIMELINE_STOP  = 0x23,
     IC_MSG_TTS_REQUEST    = 0x24,  // payload = UTF-8 text (no NUL)
     IC_MSG_TTS_PLAYED     = 0x25,  // core0 finished playback → pop queue
+    IC_MSG_RADIO_START    = 0x26,  // start internet-radio stream (no payload)
+    IC_MSG_RADIO_STOP     = 0x27,  // stop in-flight radio stream
 
     // --- Core1 → Core0 status / data messages ---
     IC_MSG_LABS_READY     = 0x30,  // labs JSON parsed, g_lab_ids[] populated
     IC_MSG_TTS_PCM_CHUNK  = 0x31,  // payload = raw int16-LE PCM bytes
     IC_MSG_TTS_END        = 0x32,  // no more PCM for the in-flight TTS
+    IC_MSG_TTS_OPUS_PKT   = 0x33,  // payload = raw opus packet (decode on core0)
 } ic_msg_t;
 
 // Initialize both rings. Safe to call from each core; first call wins.
@@ -65,3 +68,10 @@ int  ic_recv(ic_msg_t *out_type, void *payload_buf,
 // entry is moved into a per-core 1-deep cache on first peek, so consume
 // must happen via ic_try_recv (which checks the cache before the FIFO).
 int  ic_peek_type(ic_msg_t *out_type);
+
+// Producer-side: number of bytes that would fit into the local→remote ring
+// right now WITHOUT blocking. Returns 0 if either the ring is full or the
+// hardware notification FIFO (8 slots) is full — both would cause ic_send
+// to block. Callers can use this to skip a ship instead of stalling cyw43
+// poll on a slow consumer.
+uint32_t ic_send_avail(void);

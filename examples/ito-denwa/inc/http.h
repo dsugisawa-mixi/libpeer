@@ -83,12 +83,12 @@ extern volatile uint32_t      g_tts_sample_rate;     // parsed from X-Sample-Rat
 extern volatile size_t g_tts_play_pos;       // bytes forwarded via FIFO (core1)
 extern bool          g_https_chunked;
 // True when the response Content-Type is "audio/opus" — i.e. the server
-// honored our "opus":true request. Drives the opus decode path on core1
+// honored our "opus":true request. Drives the opus decode path on core0
 // and the eager chunked decoding in http_check_complete.
-extern bool          g_https_body_opus;
-extern size_t        g_chunked_read_pos;     // offset (from body_start) into raw chunked stream
-extern size_t        g_chunked_write_pos;    // offset where decoded PCM bytes have been written
-extern chunk_state_t g_chunked_state;
+extern volatile bool          g_https_body_opus;
+extern volatile size_t        g_chunked_read_pos;   // offset (from body_start) into raw chunked stream
+extern volatile size_t        g_chunked_write_pos;  // offset where decoded PCM bytes have been written
+extern volatile chunk_state_t g_chunked_state;
 
 // === Public API ===========================================================
 // Set the connection state and stamp g_https_state_at with the current ms.

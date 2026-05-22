@@ -128,7 +128,22 @@ target_compile_definitions(${PRJ} PRIVATE
     # lockout victim was registered. In normal bootmode core1 is running
     # but never writes flash, so the assume-safe path is correct there too.
     PICO_FLASH_ASSUME_CORE1_SAFE=1
+    # Core 0's stack lives in main RAM (see memmap_bigstack.ld) so libopus
+    # SILK WB 20 ms fixed-point fits: pcm[480] frame buffer + ~3 KB SILK
+    # VLAs blow past SCRATCH_Y's 4 KB. 16 KB gives the decoder real
+    # headroom and leaves ~480 KB for everything else.
+    PICO_STACK_SIZE=0x4000
+    # Core 1 keeps its 4 KB SCRATCH_X budget — without this override
+    # PICO_CORE1_STACK_SIZE inherits PICO_STACK_SIZE (16 KB) and the
+    # linker fails because core1_stack[] is placed in SCRATCH_X.
+    # Core 1 no longer runs opus_decode so 4 KB is plenty.
+    PICO_CORE1_STACK_SIZE=0x1000
 )
+
+# Override the SDK's default RP2350 memmap to relocate .stack into main
+# RAM. Must come AFTER the target is fully configured (linked-library
+# count etc.) but BEFORE pico_add_extra_outputs reads the final layout.
+pico_set_linker_script(${PRJ} ${CMAKE_CURRENT_LIST_DIR}/memmap_bigstack.ld)
 
 pico_add_extra_outputs(${PRJ})
 

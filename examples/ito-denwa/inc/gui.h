@@ -47,6 +47,7 @@ extern volatile view_state_t g_view;
 extern volatile lab_state_t  g_lab_state;
 extern char     g_operator_ids[MAX_LABS][MAX_LAB_ID_LEN];
 extern char     g_lab_ids[MAX_LABS][MAX_LAB_ID_LEN];
+extern bool     g_lab_is_radio[MAX_LABS];
 extern int      g_lab_count;
 extern int      g_lab_selected;
 extern bool     g_timeline_active;

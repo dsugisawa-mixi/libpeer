@@ -1,4 +1,4 @@
-// Opus packet decoder for streaming TTS (24 kHz mono, 20 ms frames).
+// Opus packet decoder for streaming TTS (16 kHz mono, 20 ms frames).
 //
 // Wire format on the HTTPS body (server-side: request JSON has "opus": true):
 //
@@ -13,15 +13,26 @@
 #include <stddef.h>
 #include <stdint.h>
 
-// 20 ms @ 24 kHz mono.
+// PCM-output buffer size used per decoded frame. Sized for 20 ms @ 24 kHz =
+// 480 samples — the worst case among rates we negotiate with the server (TTS
+// uses 24 kHz, radio uses 16 kHz). opus_decode returns the actual sample
+// count, which is ≤ this max for any rate ≤ 24 kHz at 20 ms.
 #define OPUS_STREAM_FRAME_SAMPLES  480
 // Defensive upper bound on a single opus packet. RFC 6716 allows up to
-// 1275 bytes per packet; at 24 kbps / 20 ms we expect ~60 B average, so
+// 1275 bytes per packet; at 16-24 kbps / 20 ms we expect ~40-60 B average, so
 // anything beyond this is almost certainly a framing desync.
 #define OPUS_STREAM_MAX_PACKET     1500
 
-// One-shot decoder bring-up. Idempotent. Returns 0 on success, -1 on failure.
+// One-shot decoder bring-up at the default rate (16 kHz). Idempotent.
+// Returns 0 on success, -1 on failure. Prefer opus_stream_set_rate() when
+// you know the playback rate up front.
 int  opus_stream_init(void);
+
+// Recreate the decoder at `hz` if the current decoder is at a different
+// rate (or doesn't exist yet). Cheap no-op if the rate is unchanged.
+// Server's X-Sample-Rate / X-Opus-Sample-Rate drives this — TTS uses 24 kHz,
+// the radio broadcast uses 16 kHz, so we negotiate per-stream.
+int  opus_stream_set_rate(uint32_t hz);
 
 // Forget all stateful decoder context (PLC history, etc.). Call at the
 // start of each new TTS playback.

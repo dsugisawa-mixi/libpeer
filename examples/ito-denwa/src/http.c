@@ -37,11 +37,11 @@ volatile size_t        g_https_body_start   = 0;
 volatile int           g_https_content_len  = -1;
 volatile uint32_t      g_tts_sample_rate    = 24000;
 
-bool          g_https_chunked     = false;
-bool          g_https_body_opus   = false;
-size_t        g_chunked_read_pos  = 0;
-size_t        g_chunked_write_pos = 0;
-chunk_state_t g_chunked_state     = CHUNK_NEED_SIZE;
+bool                   g_https_chunked     = false;
+volatile bool          g_https_body_opus   = false;
+volatile size_t        g_chunked_read_pos  = 0;
+volatile size_t        g_chunked_write_pos = 0;
+volatile chunk_state_t g_chunked_state     = CHUNK_NEED_SIZE;
 
 //=============================================================================
 // Internal state
@@ -168,11 +168,25 @@ static int parse_lab_response(const char *body) {
         cJSON *lab = cJSON_GetObjectItem(op, "lab");
         if (!cJSON_IsObject(lab)) continue;
         cJSON *lab_id = cJSON_GetObjectItem(lab, "lab_id");
-        if (!cJSON_IsString(lab_id) || !lab_id->valuestring) continue;
+        cJSON *lab_name = cJSON_GetObjectItem(lab, "name");
+        cJSON *role = cJSON_GetObjectItem(op, "role");
+        bool is_radio = cJSON_IsString(role) && role->valuestring
+                        && strcmp(role->valuestring, "internetradio") == 0;
+        // Pick a display label: prefer lab_id, fall back to lab.name when
+        // lab_id is empty (the server returns "" for radio operators).
+        const char *label = NULL;
+        if (cJSON_IsString(lab_id) && lab_id->valuestring && lab_id->valuestring[0]) {
+            label = lab_id->valuestring;
+        } else if (cJSON_IsString(lab_name) && lab_name->valuestring && lab_name->valuestring[0]) {
+            label = lab_name->valuestring;
+        } else {
+            continue;
+        }
         strncpy(g_operator_ids[count], op_id->valuestring,  MAX_LAB_ID_LEN - 1);
         g_operator_ids[count][MAX_LAB_ID_LEN - 1] = '\0';
-        strncpy(g_lab_ids[count],      lab_id->valuestring, MAX_LAB_ID_LEN - 1);
+        strncpy(g_lab_ids[count],      label,               MAX_LAB_ID_LEN - 1);
         g_lab_ids[count][MAX_LAB_ID_LEN - 1] = '\0';
+        g_lab_is_radio[count] = is_radio;
         count++;
     }
     cJSON_Delete(root);
@@ -180,7 +194,8 @@ static int parse_lab_response(const char *body) {
     g_lab_selected = 0;
     printf("[json] extracted %d operator/lab pair(s)\n", count);
     for (int i = 0; i < count; i++) {
-        printf("        [%d] op=%s lab=%s\n", i, g_operator_ids[i], g_lab_ids[i]);
+        printf("        [%d] op=%s lab=%s radio=%d\n",
+               i, g_operator_ids[i], g_lab_ids[i], (int)g_lab_is_radio[i]);
     }
     return 0;
 }
@@ -279,19 +294,42 @@ void https_handle_done(void) {
 }
 
 void http_apply_tts_headers(void) {
-    const char *sr = http_find_header(g_https_resp, g_https_body_start, "X-Sample-Rate");
-    uint32_t hz = 24000;
-    if (sr) {
-        int v = atoi(sr);
-        if (v >= 8000 && v <= 96000) hz = (uint32_t)v;
-    }
-    g_tts_sample_rate = hz;
     const char *te = http_find_header(g_https_resp, g_https_body_start, "Transfer-Encoding");
     g_https_chunked = (te && strncasecmp(te, "chunked", 7) == 0);
     const char *ct = http_find_header(g_https_resp, g_https_body_start, "Content-Type");
     g_https_body_opus = (ct && strncasecmp(ct, "audio/opus", 10) == 0);
-    printf("[tts] sample_rate=%u chunked=%d opus=%d\n",
-           (unsigned)hz, (int)g_https_chunked, (int)g_https_body_opus);
+
+    // Opus mode: force 16 kHz unconditionally. The origin (server-design.py
+    // /api/generate_stream use_opus block) is hardcoded to OPUS_SR=16000 and
+    // emits X-Opus-Sample-Rate: 16000, but something in the proxy chain
+    // (two `server: uvicorn` lines in the response are the smoking gun) is
+    // dropping the X-Opus-* family before it reaches the device — only
+    // X-Sample-Rate: 24000 (the legacy header) survives. Honouring that 24000
+    // here would mismatch the actual 16 kHz Opus stream and play back 1.5×
+    // too fast. So: Content-Type=audio/opus ⇒ 16 kHz, period. The X-*
+    // negotiation can come back if the proxy is fixed.
+    //
+    // PCM (non-opus) responses still parse X-Sample-Rate normally.
+    const char *sr_opus = http_find_header(g_https_resp, g_https_body_start,
+                                           "X-Opus-Sample-Rate");
+    const char *sr_plain = http_find_header(g_https_resp, g_https_body_start,
+                                            "X-Sample-Rate");
+    uint32_t hz;
+    if (g_https_body_opus) {
+        hz = 16000;
+    } else {
+        hz = 24000;
+        if (sr_plain) {
+            int v = atoi(sr_plain);
+            if (v >= 8000 && v <= 96000) hz = (uint32_t)v;
+        }
+    }
+    g_tts_sample_rate = hz;
+
+    printf("[tts] sample_rate=%u chunked=%d opus=%d (X-Opus-SR=%.6s X-SR=%.6s)\n",
+           (unsigned)hz, (int)g_https_chunked, (int)g_https_body_opus,
+           sr_opus ? sr_opus : "(none)",
+           sr_plain ? sr_plain : "(none)");
 }
 
 void http_resp_compact_locked(void) {
@@ -326,8 +364,12 @@ static void http_check_complete(void) {
         g_https_body_start   = (size_t)(body - g_https_resp);
         g_https_headers_done = true;
 
-        // Dump first ~256 bytes for visibility
-        size_t dump = g_https_resp_len < 256 ? g_https_resp_len : 256;
+        // Dump the entire header section (bounded by body_start, not a fixed
+        // 256 B window). The truncated dump used to hide X-Opus-Sample-Rate
+        // and X-Source-Sample-Rate, which mattered when sample-rate
+        // negotiation went wrong.
+        size_t dump = g_https_body_start;
+        if (dump > sizeof(g_https_resp) - 1) dump = sizeof(g_https_resp) - 1;
         char saved = g_https_resp[dump];
         g_https_resp[dump] = '\0';
         printf("[https] head:\n%s\n", g_https_resp);
@@ -437,6 +479,12 @@ static err_t https_recv_cb(void *arg, struct altcp_pcb *pcb, struct pbuf *p, err
     g_https_resp[g_https_resp_len] = '\0';
     altcp_recved(pcb, need);
     pbuf_free(p);
+    // Treat any received data as activity so HTTPS_TIMEOUT_MS becomes an
+    // idle timeout, not a total-time-in-state bound. Long TTS streams stay
+    // in HC_REQUESTING for the whole download.
+    g_https_state_at = http_now_ms();
+    // g_https_resp is core1-only now (recv_cb, chunked decode, forward_pump,
+    // compact all run sequentially in core1's main loop) — no lock needed.
     http_check_complete();
     return ERR_OK;
 }
@@ -614,9 +662,15 @@ void http_chunked_decode_in_place(void) {
                 g_chunked_remaining = g_chunked_size_acc;
                 g_chunked_size_acc  = 0;
                 g_chunked_in_ext    = false;
-                printf("[chunked] new chunk size=%u at read_pos=%u (resp_have=%u write_pos=%u)\n",
-                       (unsigned)g_chunked_remaining, (unsigned)g_chunked_read_pos,
-                       (unsigned)resp_have, (unsigned)g_chunked_write_pos);
+                // Per-chunk printf is hot on the TTS path — bursts of 13+
+                // chunks at once compete with audio cadence on the UART. Log
+                // only for non-TTS modes and for the chunked terminator
+                // (size=0) which is rare and useful.
+                if (g_https_mode != HM_TTS || g_chunked_remaining == 0) {
+                    printf("[chunked] new chunk size=%u at read_pos=%u (resp_have=%u write_pos=%u)\n",
+                           (unsigned)g_chunked_remaining, (unsigned)g_chunked_read_pos,
+                           (unsigned)resp_have, (unsigned)g_chunked_write_pos);
+                }
                 if (g_chunked_remaining == 0) {
                     g_chunked_state = CHUNK_DONE;
                     g_chunked_read_pos++;
@@ -636,6 +690,20 @@ void http_chunked_decode_in_place(void) {
             size_t avail = resp_have - g_chunked_read_pos;
             size_t take  = (avail < g_chunked_remaining) ? avail : g_chunked_remaining;
             if (take == 0) return;  // need more input
+            // DEBUG (one-shot): show source bytes BEFORE memmove. Lets us
+            // tell "server sent without BE16 length" from "memmove shifted
+            // the bytes off". Prints once across the whole session.
+            static bool dumped_src = false;
+            if (!dumped_src && take >= 16) {
+                dumped_src = true;
+                printf("[chunked-src] read_pos=%u write_pos=%u take=%u first16:",
+                       (unsigned)g_chunked_read_pos,
+                       (unsigned)g_chunked_write_pos,
+                       (unsigned)take);
+                for (int i = 0; i < 16; i++)
+                    printf(" %02x", base[g_chunked_read_pos + i]);
+                printf("\n");
+            }
             size_t prev_wp = g_chunked_write_pos;
             if (g_chunked_write_pos != g_chunked_read_pos) {
                 memmove(base + g_chunked_write_pos,

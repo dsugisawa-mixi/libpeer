@@ -108,6 +108,16 @@ int ic_send(ic_msg_t type, const void *payload, uint16_t length) {
     return 0;
 }
 
+uint32_t ic_send_avail(void) {
+    // FIFO check first: even if the ring has space, multicore_fifo_push_blocking
+    // inside ic_send will stall if the 8-slot notification FIFO is full. That
+    // would block core1's main loop and starve cyw43_arch_poll — the very
+    // failure mode we added this for. Treat FIFO-full as "0 bytes available".
+    if (!multicore_fifo_wready()) return 0;
+    ic_ring_t *r = prod_ring();
+    return IC_RING_SIZE - (r->head - r->tail);
+}
+
 int ic_peek_type(ic_msg_t *out_type) {
     int self = get_core_num();
     if (!g_peek_cache[self].valid) {

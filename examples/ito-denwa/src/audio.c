@@ -87,21 +87,26 @@ static inline uint32_t dma_consumed_abs(void) {
 void audio_set_sample_rate(uint32_t hz) {
     if (hz < 8000)  hz = 8000;
     if (hz > 96000) hz = 96000;
-    // PIO frame is now 128 cycles (64 BCK × 2 PIO cycles/BCK) instead of 64.
+    // PIO frame is 128 cycles (64 BCK × 2 PIO cycles/BCK).
     // BCK = sample_rate × 64 (32 BCK per channel × 2 channels).
     float sys_hz = (float)clock_get_hz(clk_sys);
     float div    = sys_hz / ((float)hz * 128.0f);
+    // RP2350 PIO CLKDIV is only re-sampled on SM enable or pio_sm_clkdiv_restart.
+    // Writing CLKDIV on a running SM keeps the OLD divider — boot beep ran at
+    // 24 kHz, TTS streams 16 kHz, and without this disable/re-enable the I2S
+    // clock stayed at the 24 kHz boot value → 16 kHz audio came out 1.5× too
+    // fast. (A previous attempt at pio_sm_clkdiv_restart on a hot SM stalled
+    // DMA; flipping enable explicitly is the safe re-load path.)
+    bool was_ready = g_audio_ready;
+    if (was_ready) pio_sm_set_enabled(AUDIO_PIO, g_audio_sm, false);
     pio_sm_set_clkdiv(AUDIO_PIO, g_audio_sm, div);
+    pio_sm_clkdiv_restart(AUDIO_PIO, g_audio_sm);
+    if (was_ready) pio_sm_set_enabled(AUDIO_PIO, g_audio_sm, true);
     printf("[audio] clk_sys=%.0fHz target=%uHz div=%.3f → PIO=%.0fHz BCK=%.0fHz frame=%.0fHz\n",
            (double)sys_hz, (unsigned)hz, (double)div,
            (double)(sys_hz / div),
            (double)(sys_hz / div / 2.0f),
            (double)(sys_hz / div / 128.0f));
-    // NOTE: deliberately NOT calling pio_sm_clkdiv_restart() here. The PIO
-    // CLKDIV register is double-buffered — the new ratio takes effect at the
-    // end of the divider's current period without needing a restart. Calling
-    // clkdiv_restart on a running SM appeared to halt PIO/DMA on RP2350 in
-    // our setup (audio ring went to 2047/2048 and never drained).
 }
 
 void audio_init(void) {

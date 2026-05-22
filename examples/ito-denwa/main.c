@@ -17,6 +17,7 @@
 #include "pico/multicore.h"
 #include "hardware/watchdog.h"
 #include "hardware/clocks.h"
+#include "hardware/vreg.h"   // vreg_set_voltage for 200 MHz overclock
 
 #include "common.h"
 #include "st7789.h"
@@ -28,6 +29,7 @@
 #include "led.h"
 #include "wifi.h"
 #include "tts.h"
+#include "opus_stream.h"
 #include "credentials.h"
 #include "ble_provision.h"
 
@@ -74,7 +76,11 @@ typedef enum {
 static volatile core0_state_t g_core0_state = CORE0_S_INIT;
 static volatile core1_state_t g_core1_state = CORE1_S_INIT;
 
-#define IC_RECV_BUF_BYTES 1024
+// Sized to fit the largest single IC message: opus packets shipped from
+// core1 via IC_MSG_TTS_OPUS_PKT. RFC 6716 allows up to 1275 B per packet
+// (OPUS_STREAM_MAX_PACKET = 1500 is the defensive upper bound); 1536 here
+// rounds up with headroom so the recv buffer never truncates a packet.
+#define IC_RECV_BUF_BYTES 1536
 static uint8_t g_core0_recv_buf[IC_RECV_BUF_BYTES];
 static uint8_t g_core1_recv_buf[IC_RECV_BUF_BYTES];
 
@@ -85,6 +91,7 @@ static bool     g_core1_fetch_pending = false;
 static uint32_t g_timeline_last_poll  = 0;
 static bool     g_core1_tl_active     = false;
 static char     g_timeline_operator_id[MAX_LAB_ID_LEN] = "";
+static bool     g_core1_radio_pending = false;
 
 //=============================================================================
 // Core 1 — forward declarations
@@ -170,6 +177,21 @@ static void on_core1_running(void) {
         if (http_kick_info(g_wifi_creds.device_id) != 0) http_set_state(HC_DONE_ERR);
     }
 
+    // Internet-radio stream start. The server identifies radio operators by
+    // X-Device-Id, so we send the same generate_stream POST body as TTS
+    // (placeholder text); the server returns the radio stream when the
+    // device's mapped operator has role=internetradio.
+    if (g_core1_radio_pending && !https_busy) {
+        g_core1_radio_pending = false;
+        printf("[core1] POST tts (radio kick)\n");
+        if (tts_kick_request("", NULL, &g_api_ip, g_https_host,
+                             g_wifi_creds.device_id,
+                             g_wifi_creds.opus_enabled) != 0) {
+            http_set_state(HC_DONE_ERR);
+        }
+        https_busy = true;
+    }
+
     // TTS queue processing
     if (!https_busy && tts_queue_count() > 0) {
         const char *msg    = tts_queue_peek();
@@ -209,10 +231,11 @@ static void on_core1_running(void) {
         tts_queue_push("こんにちは", NULL);
     }
 
-    // Periodic state dump
+    // Periodic state dump. Silenced during TTS to keep UART quiet — the
+    // [tts/stat] aggregate already covers what we care about while streaming.
     if (g_https_state != HC_IDLE) {
         uint32_t now = board_millis();
-        if ((now - last_dbg) >= 1000) {
+        if ((now - last_dbg) >= 1000 && g_https_mode != HM_TTS) {
             last_dbg = now;
             printf("[core1] https_state=%d mode=%d elapsed=%lums resp_len=%u tts_q=%d play=%d\n",
                    (int)g_https_state, (int)g_https_mode,
@@ -259,6 +282,21 @@ static void handle_core1_notify(ic_msg_t type, const uint8_t *payload, uint16_t 
         g_core1_tl_active = false;
         printf("[core1] TIMELINE_STOP\n");
         break;
+    case IC_MSG_RADIO_START:
+        g_core1_radio_pending = true;
+        printf("[core1] RADIO_START queued\n");
+        break;
+    case IC_MSG_RADIO_STOP:
+        // Tear down the in-flight TLS pcb and flag the transport idle. The
+        // forward pump then sees stream_done && source_drained and ships
+        // IC_MSG_TTS_END, which drains the audio ring and flips
+        // g_tts_play_active back off — same finalization path as a normal
+        // TTS body ending naturally.
+        printf("[core1] RADIO_STOP — cleanup pcb\n");
+        g_core1_radio_pending = false;
+        http_cleanup();
+        http_set_state(HC_IDLE);
+        break;
     case IC_MSG_TTS_PLAYED:
         if (g_tts_play_active) g_tts_play_active = false;
         tts_queue_pop();
@@ -300,9 +338,33 @@ static void core0_loop(void) {
     while (1) {
         ic_msg_t mtype; uint16_t mlen;
         while (ic_peek_type(&mtype) == 0) {
+            // Raw-PCM back-pressure: keep the pending staging buffer from
+            // overflowing.
             if (mtype == IC_MSG_TTS_PCM_CHUNK
                 && g_core0_pcm_pending_len + TTS_FWD_CHUNK_SIZE
                        > TTS_PCM_PENDING_CAP) {
+                break;
+            }
+            // Opus back-pressure: stop dequeuing opus packets when the audio
+            // ring is ≥75 % full so we don't decode+write past the ring's
+            // tail. Pressure cascades back through IC ring → forward_pump
+            // skip → g_https_resp fill → recv_cb ERR_MEM → TCP window close,
+            // throttling the server without ever blocking core1's main loop.
+            if (mtype == IC_MSG_TTS_OPUS_PKT
+                && audio_stream_buffered() > (BUF_FRAMES * 3) / 4) {
+                // Throttled diagnostic: confirms the dispatcher is
+                // back-pressuring (vs. some other stall). Pair with the
+                // [tts/opus] ship-block log on core1 to localize wedges.
+                static uint32_t last_drain_log = 0;
+                uint32_t now_drain = board_millis();
+                if ((now_drain - last_drain_log) >= 500) {
+                    last_drain_log = now_drain;
+                    printf("[core0] opus drain paused: buffered=%u/%u "
+                           "(threshold=%u)\n",
+                           (unsigned)audio_stream_buffered(),
+                           (unsigned)BUF_FRAMES,
+                           (unsigned)((BUF_FRAMES * 3) / 4));
+                }
                 break;
             }
             ic_try_recv(&mtype, g_core0_recv_buf,
@@ -427,14 +489,21 @@ static void on_core0_running(void) {
         render_lab_spinner(spinner_phase, fast_blink);
     }
 
-    // Periodic debug log
-    if ((now - last_log) >= 1000) {
+    // Periodic debug log. Silenced while a TTS request is in flight (or
+    // playback is active) so the UART doesn't compete with audio cadence.
+    bool tts_busy = g_tts_play_active
+                 || (g_https_state != HC_IDLE && g_https_mode == HM_TTS);
+    if ((now - last_log) >= 1000 && !tts_busy) {
         last_log = now;
         printf("[core0] t=%lu ms view=%d lab_state=%d count=%d sel=%d tl_active=%d\n",
                (unsigned long)now, (int)g_view, (int)g_lab_state,
                g_lab_count, g_lab_selected, (int)g_timeline_active);
     }
-    sleep_ms(10);
+    // 1 ms (was 10 ms): the previous cadence let the IC ring fill for up to
+    // ~10 ms before tts_play_pump drained it, which made core1's ic_send block
+    // on a full ring → opus decode latency ballooned (max_us hit 265 ms in
+    // [tts/stat]). 1 ms keeps PCM draining promptly without burning the core.
+    sleep_us(1000);
 }
 
 //=============================================================================
@@ -463,6 +532,29 @@ static void handle_core0_notify(ic_msg_t type, const uint8_t *payload, uint16_t 
         memcpy(g_core0_pcm_pending + g_core0_pcm_pending_len, payload, length);
         g_core0_pcm_pending_len += length;
         break;
+    case IC_MSG_TTS_OPUS_PKT: {
+        // Opus packets arrive in stream order from core1's forward_pump.
+        // Decode here (core0) so core1 stays free for cyw43_arch_poll / TLS,
+        // and write straight into the audio ring. The dispatcher's
+        // audio_stream_buffered() > 75 % gate prevents this from racing past
+        // the DMA tail; on overflow audio_stream_write_mono16 just returns
+        // partial, but the gate makes that path unreachable in practice.
+        //
+        // pcm[] is static because core0's stack lives in SCRATCH_Y (4 KB
+        // total on RP2350). libopus's SILK WB 20 ms fixed-point decoder
+        // already consumes ~3 KB of VLAs; a stack-allocated 960 B pcm[]
+        // on top of that overflows the stack, corrupts return addresses,
+        // and silently wedges the dispatcher (audio underruns forever,
+        // no further [tts/opus] forward log lines because core1's
+        // ic_send blocks on the FIFO that core0 stops draining). Static
+        // is safe here because handle_core0_notify is the sole consumer
+        // and runs single-threaded on core0.
+        static int16_t pcm[OPUS_STREAM_FRAME_SAMPLES];
+        int n = opus_stream_decode_frame(payload, length,
+                                         pcm, OPUS_STREAM_FRAME_SAMPLES);
+        if (n > 0) audio_stream_write_mono16(pcm, (size_t)n);
+        break;
+    }
     case IC_MSG_TTS_END:
         g_core0_tts_stream_done = true;
         printf("[core0] TTS_END (pending=%u)\n",
@@ -521,7 +613,14 @@ static void run_provisioning_and_reboot(void) {
 // Entry point (runs on Core 0)
 //=============================================================================
 int main() {
-    set_sys_clock_khz(153600, true);
+    // 200 MHz overclock. RP2350's default 150 MHz leaves the libopus decoder
+    // right at realtime for 16 kHz/16 kbps Opus on dense music frames
+    // (CELT/Hybrid mode), eating all headroom; [tts/stat] cpu_ms pinned ~1000
+    // and any spike caused an audio underrun. Bumping vreg to 1.15 V before
+    // the clock change keeps the PLL stable above the default 1.10 V rail.
+    vreg_set_voltage(VREG_VOLTAGE_1_15);
+    sleep_ms(2);
+    set_sys_clock_khz(200000, true);
 
     uart_init(uart0, 115200);
     gpio_set_function(0, GPIO_FUNC_UART);
@@ -553,7 +652,6 @@ int main() {
     }
 
     ic_init();
-
     printf("Launching core1 for CYW43/WiFi/HTTPS...\n");
     multicore_launch_core1(core1_entry);
 

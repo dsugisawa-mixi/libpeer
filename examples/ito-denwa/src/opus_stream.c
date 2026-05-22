@@ -5,21 +5,37 @@
 
 #include "opus.h"
 
-#define OPUS_SR  24000
+// Default rate for opus_stream_init() — chosen low so the boot-time
+// decoder allocation matches the radio path (which dominates uptime).
+// Single-utterance TTS pumps will call opus_stream_set_rate(24000) before
+// playback starts and the decoder gets recreated.
+#define OPUS_SR_DEFAULT  16000
 
-static OpusDecoder *g_decoder = NULL;
+static OpusDecoder *g_decoder    = NULL;
+static uint32_t     g_decoder_sr = 0;
 
-int opus_stream_init(void) {
-    if (g_decoder) return 0;
+int opus_stream_set_rate(uint32_t hz) {
+    if (g_decoder && g_decoder_sr == hz) return 0;
+    if (g_decoder) {
+        opus_decoder_destroy(g_decoder);
+        g_decoder    = NULL;
+        g_decoder_sr = 0;
+    }
     int err = OPUS_OK;
-    g_decoder = opus_decoder_create(OPUS_SR, 1, &err);
+    g_decoder = opus_decoder_create((opus_int32)hz, 1, &err);
     if (!g_decoder || err != OPUS_OK) {
-        printf("[opus] decoder_create failed err=%d\n", err);
+        printf("[opus] decoder_create(%u Hz) failed err=%d\n", (unsigned)hz, err);
         g_decoder = NULL;
         return -1;
     }
-    printf("[opus] decoder ready (24kHz mono, fixed-point)\n");
+    g_decoder_sr = hz;
+    printf("[opus] decoder ready (%uHz mono, fixed-point)\n", (unsigned)hz);
     return 0;
+}
+
+int opus_stream_init(void) {
+    if (g_decoder) return 0;
+    return opus_stream_set_rate(OPUS_SR_DEFAULT);
 }
 
 void opus_stream_reset(void) {
