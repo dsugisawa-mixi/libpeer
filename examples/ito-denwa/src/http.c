@@ -37,6 +37,9 @@ volatile size_t        g_https_body_start   = 0;
 volatile int           g_https_content_len  = -1;
 volatile uint32_t      g_tts_sample_rate    = 24000;
 
+volatile uint32_t      g_recv_bytes        = 0;
+volatile uint32_t      g_recv_pkts         = 0;
+
 bool                   g_https_chunked     = false;
 volatile bool          g_https_body_opus   = false;
 volatile size_t        g_chunked_read_pos  = 0;
@@ -479,6 +482,8 @@ static err_t https_recv_cb(void *arg, struct altcp_pcb *pcb, struct pbuf *p, err
     if (g_https_resp_len + need >= sizeof(g_https_resp)) {
         return ERR_MEM;
     }
+    g_recv_bytes += need;
+    g_recv_pkts++;
     pbuf_copy_partial(p, g_https_resp + g_https_resp_len, need, 0);
     g_https_resp_len += need;
     g_https_resp[g_https_resp_len] = '\0';

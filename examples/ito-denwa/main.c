@@ -162,7 +162,9 @@ static void on_core1_wait_audio(void) {
 
 static void on_core1_running(void) {
     static uint32_t last_dbg = 0;
+    static uint32_t last_bw  = 0;
     if (last_dbg == 0) last_dbg = board_millis();
+    if (last_bw  == 0) last_bw  = board_millis();
 
     cyw43_arch_poll();
 
@@ -258,6 +260,24 @@ static void on_core1_running(void) {
         }
     } else {
         last_dbg = board_millis();
+    }
+
+    {
+        uint32_t now_bw = board_millis();
+        if ((now_bw - last_bw) >= 10000) {
+            uint32_t b = g_recv_bytes;
+            uint32_t p = g_recv_pkts;
+            g_recv_bytes = 0;
+            g_recv_pkts  = 0;
+            uint32_t dt  = now_bw - last_bw;
+            uint32_t wire = b + p * 40;
+            uint32_t kbps = wire * 8 * 1000 / dt / 1000;
+            printf("[core1/bw] %us: payload=%u wire~%u (%u KB/s %u kbps) pkts=%u\n",
+                   (unsigned)(dt / 1000), (unsigned)b, (unsigned)wire,
+                   (unsigned)(wire * 1000 / dt / 1024), (unsigned)kbps,
+                   (unsigned)p);
+            last_bw = now_bw;
+        }
     }
 
     led_blink_loop();

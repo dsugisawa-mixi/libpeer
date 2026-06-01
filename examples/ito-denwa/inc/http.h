@@ -80,6 +80,9 @@ extern volatile size_t        g_https_body_start;
 extern volatile int           g_https_content_len;   // -1 = unknown
 extern volatile uint32_t      g_tts_sample_rate;     // parsed from X-Sample-Rate
 
+extern volatile uint32_t g_recv_bytes;       // TCP payload bytes since last log
+extern volatile uint32_t g_recv_pkts;        // recv callbacks since last log
+
 extern volatile size_t g_tts_play_pos;       // bytes forwarded via FIFO (core1)
 extern bool          g_https_chunked;
 // True when the response Content-Type is "audio/opus" — i.e. the server
