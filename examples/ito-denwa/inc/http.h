@@ -32,8 +32,11 @@
 // recv_cb has ERR_MEM backpressure if the buffer ever fills (real for
 // TTS — see above), so the bound is hard-safe.
 #define RESP_BUF_SIZE       (128 * 1024)
-// Big enough for HTTP POST headers + a few KB of UTF-8 message body.
-#define REQ_BUF_SIZE        4096
+// Big enough for HTTP POST headers + a few KB of UTF-8 message body, PLUS
+// the linephone POST which carries a base64-encoded opus stream (up to ~16 KB
+// of base64 payload + ~256 B headers). 20 KB covers the LP_OPUS_CAP ceiling
+// with a comfortable margin.
+#define REQ_BUF_SIZE        (20 * 1024)
 #define HTTPS_TIMEOUT_MS    20000
 // altcp_poll interval is in 500ms units; 4 = 2s
 #define HTTPS_POLL_INTERVAL 4
@@ -48,9 +51,11 @@ typedef enum {
 
 // What kind of request is currently in flight (or just finished).
 typedef enum {
-    HM_INFO,      // GET /api/tunnel/info  → lab list
-    HM_TIMELINE,  // GET /api/qa/timeline?...  → JSON
-    HM_TTS,       // POST /api/tts/generate_stream  → raw PCM body
+    HM_INFO,            // GET /api/tunnel/info  → lab list
+    HM_TIMELINE,        // GET /api/qa/timeline?...  → JSON
+    HM_TTS,             // POST /api/tts/generate_stream  → raw PCM / opus body
+    HM_LINEPHONE_POST,  // POST /api/device/linephone/  → fire-and-forget (upload speech)
+    HM_LINEPHONE_GET,   // GET  /api/device/linephone/  → 200 audio/opus (reply) or 404
 } https_mode_t;
 
 // Chunked transfer-encoding decoder state (used when the server returns

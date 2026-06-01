@@ -13,6 +13,15 @@ void audio_play_sine(void);
 void audio_stop(void);
 bool audio_is_ready(void);
 
+// Pause/resume I2S output without touching the ring or the upstream decoder.
+// Used by the push-to-talk path: B-press pauses playback so the mic capture
+// isn't drowned out by the speaker, and B-release resumes from where the
+// DMA left off. Decode-side throughput naturally throttles via the existing
+// 75 %-full back-pressure cascade while paused.
+void audio_pause(void);
+void audio_resume(void);
+bool audio_is_paused(void);
+
 // Stream a sine wave through audio_stream_write_mono16() — exercises the same
 // ring/DMA path that TTS uses. If this is silent, the streaming write path is
 // the culprit; if it plays, TTS silence is a payload/format issue.

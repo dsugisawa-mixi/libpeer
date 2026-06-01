@@ -32,6 +32,7 @@
 
 static int g_audio_sm = -1;
 static int g_dma_ch   = -1;
+static volatile bool g_audio_paused = false;
 
 // 32-sample sine table (16-bit signed)
 static const int16_t sine32[32] = {
@@ -97,11 +98,16 @@ void audio_set_sample_rate(uint32_t hz) {
     // clock stayed at the 24 kHz boot value → 16 kHz audio came out 1.5× too
     // fast. (A previous attempt at pio_sm_clkdiv_restart on a hot SM stalled
     // DMA; flipping enable explicitly is the safe re-load path.)
-    bool was_ready = g_audio_ready;
-    if (was_ready) pio_sm_set_enabled(AUDIO_PIO, g_audio_sm, false);
+    // Preserve pause state across a sample-rate change: if we're paused
+    // (B-button held for push-to-talk), don't re-enable the SM here — the
+    // matching audio_resume() will turn it back on. Otherwise an upstream
+    // tts_start_playback() arriving mid-pause would silently override the
+    // pause and start emitting audio while the mic is recording.
+    bool was_running = g_audio_ready && !g_audio_paused;
+    if (was_running) pio_sm_set_enabled(AUDIO_PIO, g_audio_sm, false);
     pio_sm_set_clkdiv(AUDIO_PIO, g_audio_sm, div);
     pio_sm_clkdiv_restart(AUDIO_PIO, g_audio_sm);
-    if (was_ready) pio_sm_set_enabled(AUDIO_PIO, g_audio_sm, true);
+    if (was_running) pio_sm_set_enabled(AUDIO_PIO, g_audio_sm, true);
     printf("[audio] clk_sys=%.0fHz target=%uHz div=%.3f → PIO=%.0fHz BCK=%.0fHz frame=%.0fHz\n",
            (double)sys_hz, (unsigned)hz, (double)div,
            (double)(sys_hz / div),
@@ -341,6 +347,34 @@ void audio_stop(void) {
     g_write_abs = dma_consumed_abs() & ~1u;
     printf("[audio] STOP\n");
 }
+
+// Pause: drop the PIO state machine. DMA loses its DREQ source, so it stops
+// requesting words; the ring contents are preserved exactly as-is. Audible
+// I2S output goes silent on the next I2S frame boundary (within ~30 µs).
+// The upstream pipeline (opus decode + IC ring + g_https_resp + TCP) throttles
+// naturally as the audio ring fills past the dispatcher's 75 % threshold.
+void audio_pause(void) {
+    if (!g_audio_ready || g_audio_paused) return;
+    pio_sm_set_enabled(AUDIO_PIO, g_audio_sm, false);
+    g_audio_paused = true;
+    printf("[audio] PAUSE (buffered=%u/%u frames)\n",
+           (unsigned)audio_stream_buffered(), (unsigned)BUF_FRAMES);
+}
+
+// Resume: re-enable the PIO state machine. DMA resumes from its preserved
+// read position and plays whatever was queued at pause time before the live
+// stream catches up. After a long pause the caller will hear up to the
+// ring's worth (~170 ms @ 24 kHz) of buffered audio first.
+void audio_resume(void) {
+    if (!g_audio_ready || !g_audio_paused) return;
+    pio_sm_clkdiv_restart(AUDIO_PIO, g_audio_sm);
+    pio_sm_set_enabled(AUDIO_PIO, g_audio_sm, true);
+    g_audio_paused = false;
+    printf("[audio] RESUME (buffered=%u frames)\n",
+           (unsigned)audio_stream_buffered());
+}
+
+bool audio_is_paused(void) { return g_audio_paused; }
 
 // Underrun handler. If the writer's absolute counter has fallen behind the
 // DMA, zero a bounded region ahead of the DMA read position and snap

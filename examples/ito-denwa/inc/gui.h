@@ -8,14 +8,18 @@
 // Button IDs (indices into the internal g_buttons[] table)
 //-----------------------------------------------------------------------------
 typedef enum {
+    // GP16 / GP20 / GP21 (formerly Key-Left / Key-Right / Button-Y on the
+    // Waveshare LCD) are now wired to the INMP441 I2S RX (BCK/LRCK/SD), so
+    // those three are no longer polled as buttons — entries are commented
+    // out (in both this enum and g_buttons[]) so the indexing stays aligned.
     GUI_BTN_A = 0,
     GUI_BTN_B,
     GUI_BTN_X,
-    GUI_BTN_Y,
+    // GUI_BTN_Y,       // GP21 → INMP441 SD
     GUI_KEY_UP,
     GUI_KEY_DOWN,
-    GUI_KEY_LEFT,
-    GUI_KEY_RIGHT,
+    // GUI_KEY_LEFT,    // GP16 → INMP441 BCK
+    // GUI_KEY_RIGHT,   // GP20 → INMP441 LRCK
     GUI_KEY_CTRL,
     GUI_BTN_COUNT,
 } gui_button_id_t;
@@ -53,6 +57,7 @@ typedef struct lab_entry {
     char lab_id[MAX_LAB_ID_LEN];
     bool is_radio;
     bool is_gameserver;
+    bool is_linephone;
 } lab_entry_t, *lab_entry_ptr;
 
 extern lab_entry_t g_labs[MAX_LABS];
@@ -62,6 +67,12 @@ extern bool     g_timeline_active;
 extern char     g_timeline_lab_id[MAX_LAB_ID_LEN];
 extern volatile int  g_timeline_status_ver;
 extern volatile bool g_tts_play_active;
+
+// Linephone (walkie-talkie) mode flag. Set when the user presses Enter on
+// a role=linephone lab; gates the GET polling on core1 and the mic-on-B
+// behavior on core0. Mutually exclusive with timeline/radio.
+extern bool          g_linephone_active;
+extern char          g_linephone_lab_id[MAX_LAB_ID_LEN];
 
 //-----------------------------------------------------------------------------
 // Status log (thread-safe, called from both cores via wifi.c / main.c)

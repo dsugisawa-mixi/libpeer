@@ -5,6 +5,7 @@
 #include "tts.h"     // tts_start_playback, tts_send_end_if_needed
 #include "queue.h"   // tts_queue_push, tts_queue_pop
 #include "ic_ring.h" // ic_send, IC_MSG_*
+#include "linephone.h" // lp_handle_get_head_header
 #include "cJSON.h"
 
 #include <stdio.h>
@@ -177,6 +178,7 @@ static int parse_lab_response(const char *body) {
                                   ? role->valuestring : "";
         bool is_radio      = strcmp(role_str, "internetradio") == 0;
         bool is_gameserver = strcmp(role_str, "gameserver")    == 0;
+        bool is_linephone  = strcmp(role_str, "linephone")     == 0;
         // Pick a display label: prefer lab_id, fall back to lab.name when
         // lab_id is empty (the server returns "" for radio operators).
         const char *label = NULL;
@@ -194,6 +196,7 @@ static int parse_lab_response(const char *body) {
         e->lab_id[MAX_LAB_ID_LEN - 1] = '\0';
         e->is_radio      = is_radio;
         e->is_gameserver = is_gameserver;
+        e->is_linephone  = is_linephone;
         count++;
     }
     cJSON_Delete(root);
@@ -201,9 +204,10 @@ static int parse_lab_response(const char *body) {
     g_lab_selected = 0;
     printf("[json] extracted %d operator/lab pair(s)\n", count);
     for (int i = 0; i < count; i++) {
-        printf("        [%d] op=%s lab=%s radio=%d gameserver=%d\n",
+        printf("        [%d] op=%s lab=%s radio=%d gameserver=%d linephone=%d\n",
                i, g_labs[i].operator_id, g_labs[i].lab_id,
-               (int)g_labs[i].is_radio, (int)g_labs[i].is_gameserver);
+               (int)g_labs[i].is_radio, (int)g_labs[i].is_gameserver,
+               (int)g_labs[i].is_linephone);
     }
     return 0;
 }
@@ -292,6 +296,36 @@ void https_handle_done(void) {
         } else if (!g_tts_play_active) {
             http_apply_tts_headers();
             tts_start_playback();
+        }
+        break;
+
+    case HM_LINEPHONE_POST:
+        // Send-only — server ACKs with a small status body we don't use.
+        // Just log and go IDLE.
+        printf("[lp/post] done %s\n", ok ? "OK" : "ERR");
+        break;
+
+    case HM_LINEPHONE_GET:
+        // GET reply is audio/opus when audio is pending for this device,
+        // or 404 when nothing is queued. http_check_complete has already
+        // armed playback for the audio/opus case (same prebuffer logic as
+        // HM_TTS); the FIN fallback arm here covers a tiny reply that
+        // finishes before the prebuffer threshold.
+        //
+        // Advance the stream cursor regardless of 200/404 — the server sends
+        // X-Linephone-Head on both (it always knows the current head), so
+        // 404 still lets us skip past frames we don't want to re-pull.
+        if (g_https_headers_done) {
+            lp_handle_get_head_header(g_https_resp, g_https_body_start);
+        }
+        if (!ok || !g_https_headers_done) {
+            printf("[lp/get] request failed / no body — IDLE\n");
+            if (g_tts_play_active) tts_send_end_if_needed();
+        } else if (!g_tts_play_active && g_https_body_opus) {
+            http_apply_tts_headers();
+            tts_start_playback();
+        } else if (!g_https_body_opus) {
+            printf("[lp/get] reply non-opus (likely 404) — nothing to play\n");
         }
         break;
     }
@@ -394,8 +428,9 @@ static void http_check_complete(void) {
         // True streaming for TTS: parse X-Sample-Rate / Transfer-Encoding
         // now so we know how to drive the I2S clock and how to read the
         // body. Defer arming the audio engine until we have prebuffered
-        // enough body — see below.
-        if (g_https_mode == HM_TTS) {
+        // enough body — see below. Linephone GET replies go through the
+        // same audio/opus playback pipeline, so reuse the parser.
+        if (g_https_mode == HM_TTS || g_https_mode == HM_LINEPHONE_GET) {
             http_apply_tts_headers();
         }
     }
@@ -418,7 +453,9 @@ static void http_check_complete(void) {
     // handled in https_handle_done. PCM uses raw bytes (existing behavior);
     // opus uses decoded chunked bytes so a short response below the raw
     // threshold still arms once enough opus packets are buffered.
-    if (g_https_headers_done && g_https_mode == HM_TTS && !g_tts_play_active) {
+    if (g_https_headers_done
+        && (g_https_mode == HM_TTS || g_https_mode == HM_LINEPHONE_GET)
+        && !g_tts_play_active) {
         size_t body_have = g_https_body_opus
                              ? g_chunked_write_pos
                              : (g_https_resp_len - g_https_body_start);
@@ -510,9 +547,23 @@ static err_t https_connected_cb(void *arg, struct altcp_pcb *pcb, err_t err) {
            (unsigned long)(http_now_ms() - g_https_state_at),
            (unsigned)g_https_req_len, (int)g_https_mode);
     // For POSTs, the body may follow the headers — send everything we've prebuilt.
-    err_t werr = altcp_write(pcb, g_https_req, (u16_t)g_https_req_len, TCP_WRITE_FLAG_COPY);
+    // mbedtls_ssl_write() caps each TLS record at MBEDTLS_SSL_OUT_CONTENT_LEN
+    // (4096). The lwIP altcp_tls glue panics ("ret <= 0") if a single
+    // altcp_write() exceeds that, since it can't represent a partial record.
+    // Split into <= MBEDTLS_SSL_OUT_CONTENT_LEN chunks so each altcp_write()
+    // maps to exactly one full record. TCP_SND_BUF (16*MSS) holds them all.
+    err_t werr = ERR_OK;
+    size_t sent = 0;
+    while (sent < g_https_req_len) {
+        size_t chunk = g_https_req_len - sent;
+        if (chunk > MBEDTLS_SSL_OUT_CONTENT_LEN) chunk = MBEDTLS_SSL_OUT_CONTENT_LEN;
+        werr = altcp_write(pcb, g_https_req + sent, (u16_t)chunk, TCP_WRITE_FLAG_COPY);
+        if (werr != ERR_OK) break;
+        sent += chunk;
+    }
     if (werr != ERR_OK) {
-        printf("[https] write err=%d\n", werr);
+        printf("[https] write err=%d at sent=%u/%u\n",
+               werr, (unsigned)sent, (unsigned)g_https_req_len);
         http_set_state(HC_DONE_ERR);
         return werr;
     }

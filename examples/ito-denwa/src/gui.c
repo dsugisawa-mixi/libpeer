@@ -8,6 +8,7 @@
 #include "st7789.h"
 #include "ic_ring.h"
 #include "audio.h"
+#include "mic.h"
 
 //=============================================================================
 // Shared state (owned here, externed in gui.h)
@@ -22,6 +23,9 @@ bool          g_timeline_active    = false;
 char          g_timeline_lab_id[MAX_LAB_ID_LEN] = "";
 volatile int  g_timeline_status_ver = 0;
 volatile bool g_tts_play_active = false;
+
+bool          g_linephone_active   = false;
+char          g_linephone_lab_id[MAX_LAB_ID_LEN] = "";
 
 //=============================================================================
 // Status log (cross-core mini log on LCD)
@@ -84,15 +88,20 @@ typedef struct {
     bool        pressed;
 } button_t;
 
+// GP16 / GP20 / GP21 are repurposed as INMP441 I2S RX pins (BCK / LRCK / SD)
+// and are NOT polled here. Reading them during a recording session would
+// generate phantom PRESS/RELEASE transitions at the BCK / LRCK clock rates.
+// Entries kept commented out so the index alignment with gui_button_id_t
+// stays obvious if we ever rewire them back to buttons.
 static button_t g_buttons[] = {
     {"Button-A",  15, false},
     {"Button-B",  17, false},
     {"Button-X",  19, false},
-    {"Button-Y",  21, false},
+    // {"Button-Y",  21, false},   // GP21 → INMP441 SD
     {"Key-Up",     2, false},
     {"Key-Down",  18, false},
-    {"Key-Left",  16, false},
-    {"Key-Right", 20, false},
+    // {"Key-Left",  16, false},   // GP16 → INMP441 BCK
+    // {"Key-Right", 20, false},   // GP20 → INMP441 LRCK
     {"Key-Ctrl",   3, false},
 };
 #define NUM_BUTTONS (sizeof(g_buttons)/sizeof(g_buttons[0]))
@@ -139,7 +148,8 @@ void render_lab_error(void) {
 
 void render_lab_list(void) {
     lcd_fill(COLOR_BLACK);
-    const char *title = g_timeline_active
+    bool any_active = g_timeline_active || g_linephone_active;
+    const char *title = any_active
         ? "Labs (Enter=stop)"
         : "Labs (Enter=start)";
     lcd_draw_text(8, 4, title, FONT_SCALE, COLOR_CYAN, COLOR_BLACK);
@@ -151,7 +161,7 @@ void render_lab_list(void) {
         int y = ROW_Y0 + i * ROW_H;
         bool sel = (i == g_lab_selected);
         uint16_t bg = sel
-            ? (g_timeline_active ? COLOR_YELLOW : COLOR_GREEN)
+            ? (any_active ? COLOR_YELLOW : COLOR_GREEN)
             : COLOR_BLACK;
         uint16_t fg = sel ? COLOR_BLACK : COLOR_WHITE;
         lcd_fill_rect(0, y, LCD_W, ROW_H - 2, bg);
@@ -192,32 +202,56 @@ void trigger_fetch(void) {
 // Button event dispatch
 //=============================================================================
 static void on_button_event(int idx, bool now_pressed) {
+    // Button-B is push-to-talk: it needs BOTH press (start mic) and release
+    // (stop + post-end). Every other button only acts on press.
+    if (idx == GUI_BTN_B) {
+        if (g_linephone_active) {
+            // Push-to-talk inside linephone mode: pause receive while talking
+            // so the mic capture isn't drowned out by the speaker. The ring +
+            // upstream pipeline are preserved — audio_resume() on release
+            // picks up where DMA left off (catch-up artifact: up to a ring's
+            // worth of buffered audio replays before catching live).
+            if (now_pressed) {
+                audio_pause();
+                mic_start();
+            } else {
+                mic_stop();
+                ic_send(IC_MSG_LINEPHONE_POST_END, NULL, 0);
+                audio_resume();
+            }
+        } else if (now_pressed) {
+            // Legacy / backward-compatible: outside linephone mode B just
+            // stops in-flight audio output.
+            audio_stop();
+        }
+        return;
+    }
+
     if (!now_pressed) return;
 
     switch (idx) {
         case GUI_BTN_A:
             audio_play_sine();
             break;
-        case GUI_BTN_B:
-            audio_stop();
-            break;
         case GUI_BTN_X:
             trigger_fetch();
             break;
-        case GUI_BTN_Y:
-            g_view = VIEW_BUTTONS;
-            render_buttons_view();
-            break;
+        // case GUI_BTN_Y:   // GP21 → INMP441 SD (no longer a button)
+        //     g_view = VIEW_BUTTONS;
+        //     render_buttons_view();
+        //     break;
         case GUI_KEY_UP:
             if (g_view == VIEW_LABS && g_lab_state == LAB_OK && g_lab_count > 0
-                && !g_timeline_active && !g_tts_play_active) {
+                && !g_timeline_active && !g_linephone_active
+                && !g_tts_play_active) {
                 g_lab_selected = (g_lab_selected - 1 + g_lab_count) % g_lab_count;
                 render_lab_list();
             }
             break;
         case GUI_KEY_DOWN:
             if (g_view == VIEW_LABS && g_lab_state == LAB_OK && g_lab_count > 0
-                && !g_timeline_active && !g_tts_play_active) {
+                && !g_timeline_active && !g_linephone_active
+                && !g_tts_play_active) {
                 g_lab_selected = (g_lab_selected + 1) % g_lab_count;
                 render_lab_list();
             }
@@ -244,6 +278,37 @@ static void on_button_event(int idx, bool now_pressed) {
                                 (uint16_t)strlen(sel->operator_id));
                         printf("[core0] Enter: start radio op=%s\n",
                                sel->operator_id);
+                    }
+                } else if (sel->is_linephone) {
+                    // Toggle linephone mode. While active, core1 polls
+                    // GET /api/device/linephone/?start=N and Button-B becomes
+                    // push-to-talk (POST /api/device/linephone/).
+                    if (g_linephone_active) {
+                        // Defensive cleanup: if the user is still holding
+                        // B when they stop linephone, mic is in capture
+                        // state. Stop it and resume audio so we don't end
+                        // up with a stuck mic + paused DAC. We deliberately
+                        // do NOT ship IC_MSG_LINEPHONE_POST_END here — the
+                        // session is going away, so the captured fragment
+                        // should just be discarded.
+                        if (mic_is_active()) {
+                            mic_stop();
+                            audio_resume();
+                        }
+                        ic_send(IC_MSG_LINEPHONE_STOP, NULL, 0);
+                        g_linephone_active = false;
+                        g_linephone_lab_id[0] = '\0';
+                        printf("[core0] Enter: stop linephone\n");
+                    } else {
+                        strncpy(g_linephone_lab_id, sel->lab_id,
+                                MAX_LAB_ID_LEN - 1);
+                        g_linephone_lab_id[MAX_LAB_ID_LEN - 1] = '\0';
+                        ic_send(IC_MSG_LINEPHONE_START,
+                                sel->operator_id,
+                                (uint16_t)strlen(sel->operator_id));
+                        g_linephone_active = true;
+                        printf("[core0] Enter: start linephone op=%s lab=%s\n",
+                               sel->operator_id, g_linephone_lab_id);
                     }
                 } else if (!g_timeline_active) {
                     strncpy(g_timeline_lab_id, sel->lab_id, MAX_LAB_ID_LEN - 1);

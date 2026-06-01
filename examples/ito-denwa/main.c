@@ -32,6 +32,8 @@
 #include "opus_stream.h"
 #include "credentials.h"
 #include "ble_provision.h"
+#include "mic.h"
+#include "linephone.h"
 
 //=============================================================================
 // Configuration — only API_URL stays at build time; WiFi creds *and*
@@ -98,6 +100,23 @@ static bool     g_core1_tl_active     = false;
 // device. Empty string means "no target chosen yet".
 static char     g_core1_current_op_id[MAX_LAB_ID_LEN] = "";
 static bool     g_core1_radio_pending = false;
+// Linephone (walkie-talkie) capture-then-post state. While core0 is shipping
+// opus packets we just accumulate them; on POST_END we set the pending flag
+// so the main loop kicks the HTTPS request when no other transport is busy.
+static bool     g_core1_lp_post_pending = false;
+// Active linephone session — set by IC_MSG_LINEPHONE_START / cleared by
+// IC_MSG_LINEPHONE_STOP. Gates the GET polling loop.
+static bool     g_core1_lp_session_active = false;
+// GET poll cadence (fires only while session is active and nothing else is
+// in flight). 404 responses are tiny (just headers) but each request costs a
+// fresh TLS handshake (~100 ms CPU + a few KB of traffic), so this is the
+// main lever for trading off latency vs. load. 10 s gives a relaxed debug-
+// friendly cadence; drop to 2–3 s for a more "real" walkie-talkie feel.
+#define LP_POLL_INTERVAL_MS  10000
+static uint32_t g_core1_lp_last_poll_ms = 0;
+// Operator id of the current linephone session — pinned into GET URL so the
+// server can scope queries (and the POST already carries device_id).
+static char     g_core1_lp_op_id[MAX_LAB_ID_LEN] = "";
 
 //=============================================================================
 // Core 1 — forward declarations
@@ -183,6 +202,39 @@ static void on_core1_running(void) {
         g_core1_fetch_pending = false;
         printf("[core1] HTTPS GET info\n");
         if (http_kick_info(g_wifi_creds.device_id) != 0) http_set_state(HC_DONE_ERR);
+    }
+
+    // Linephone (push-to-talk) — base64 + POST the captured opus stream.
+    // Runs after the lab-fetch hook so it doesn't race with auto-fetch on
+    // first connection, and gated on https_busy like the TTS path.
+    if (g_core1_lp_post_pending && !https_busy) {
+        g_core1_lp_post_pending = false;
+        if (lp_kick_post(g_wifi_creds.device_id, g_core1_lp_op_id) != 0) {
+            http_set_state(HC_DONE_ERR);
+        }
+        https_busy = true;
+    }
+
+    // Linephone GET poll — the receive side of push-to-talk. Only runs while
+    // the user has entered linephone mode (Enter on a role=linephone lab);
+    // outside the mode no traffic hits /api/device/linephone/. Also gated against
+    // any other in-flight or pending transport.
+    if (g_core1_lp_session_active
+        && !https_busy
+        && !g_core1_lp_post_pending
+        && tts_queue_count() == 0
+        && !g_core1_fetch_pending
+        && !g_core1_radio_pending
+        && !g_core1_tl_active) {
+        uint32_t now = board_millis();
+        if ((now - g_core1_lp_last_poll_ms) >= LP_POLL_INTERVAL_MS) {
+            g_core1_lp_last_poll_ms = now;
+            if (lp_kick_get(g_wifi_creds.device_id, g_core1_lp_op_id) != 0) {
+                http_set_state(HC_DONE_ERR);
+            } else {
+                https_busy = true;
+            }
+        }
     }
 
     // Internet-radio stream start. Same /api/tts/generate_stream POST
@@ -340,6 +392,44 @@ static void handle_core1_notify(ic_msg_t type, const uint8_t *payload, uint16_t 
         tts_queue_pop();
         printf("[core1] TTS_PLAYED (queue=%d)\n", tts_queue_count());
         break;
+    case IC_MSG_LINEPHONE_OPUS_PKT:
+        // Mic frames only matter inside an active session — drop silently
+        // otherwise (defensive: shouldn't happen because gui.c gates B on
+        // g_linephone_active too).
+        if (g_core1_lp_session_active) lp_accum_append(payload, length);
+        break;
+    case IC_MSG_LINEPHONE_POST_END:
+        if (g_core1_lp_session_active) {
+            printf("[core1] LINEPHONE_POST_END (accum=%u B) → queue POST\n",
+                   (unsigned)lp_accum_len());
+            g_core1_lp_post_pending = true;
+        }
+        break;
+    case IC_MSG_LINEPHONE_START: {
+        uint16_t n = length;
+        if (n >= MAX_LAB_ID_LEN) n = MAX_LAB_ID_LEN - 1;
+        memcpy(g_core1_lp_op_id, payload, n);
+        g_core1_lp_op_id[n] = '\0';
+        // Fresh session: reset cursor and accumulator so we start "from
+        // the current head" (server interprets start=0 that way) and the
+        // mic buffer is empty.
+        g_lp_start_pos          = 0;
+        g_core1_lp_last_poll_ms = 0;
+        lp_accum_reset();
+        g_core1_lp_session_active = true;
+        printf("[core1] LINEPHONE_START op=%s\n", g_core1_lp_op_id);
+        break;
+    }
+    case IC_MSG_LINEPHONE_STOP:
+        g_core1_lp_session_active = false;
+        g_core1_lp_post_pending   = false;
+        g_core1_lp_op_id[0]       = '\0';
+        // Drop any frames that hadn't been POSTed yet — the next session
+        // start will reset anyway, but clearing now keeps state tidy if
+        // the device sits idle for a while between sessions.
+        lp_accum_reset();
+        printf("[core1] LINEPHONE_STOP\n");
+        break;
     default:
         printf("[core1] unhandled msg type=0x%02x in state=%d\n",
                type, (int)g_core1_state);
@@ -437,6 +527,12 @@ static void on_core0_wait_net(void) {
 static void on_core0_audio_beep_play(void) {
     printf("[core0] NET_READY received → audio_init + boot beep\n");
     audio_init();
+    // INMP441 capture pipeline init. Claims pio0 SM + a DMA channel + the
+    // Opus encoder (heap). Pins stay as plain GPIO (buttons) until
+    // mic_start() flips them to PIO at the first Button-B press.
+    if (mic_init() != 0) {
+        printf("[core0] mic_init failed — push-to-talk disabled\n");
+    }
     audio_play_sine();
     g_core0_beep_started_ms = board_millis();
     g_core0_state = CORE0_S_AUDIO_BEEP_WAIT;
@@ -474,6 +570,11 @@ static void on_core0_running(void) {
     if (last_log == 0) last_log = board_millis();
 
     buttons_poll();
+
+    // Drain captured PCM from the INMP441 DMA ring, encode 20 ms frames,
+    // and ship each opus packet to core1 via IC_MSG_LINEPHONE_OPUS_PKT.
+    // No-op when mic is not active (Button-B not held).
+    mic_pump();
 
     // Drain PCM from core1 into the audio ring buffer
     tts_play_pump();
@@ -671,12 +772,20 @@ int main() {
     printf("[TIMING] Boot complete: %lu ms\n", (unsigned long)g_time_boot);
 
     lcd_init();
-    buttons_init();   // also configures PROV_BUTTON_PIN with pull-up
+    buttons_init();
+    // GP21 (PROV_BUTTON_PIN) is wired to INMP441 SD post-boot. buttons_init
+    // no longer touches it (the entry is commented out in g_buttons[]), so
+    // explicitly configure it here as a pulled-up GPIO input for the boot-
+    // time BLE-provisioning trigger. mic_start() will reassign it to the
+    // PIO function later.
+    gpio_init(PROV_BUTTON_PIN);
+    gpio_set_dir(PROV_BUTTON_PIN, GPIO_IN);
+    gpio_pull_up(PROV_BUTTON_PIN);
     set_status("Boot %lums", (unsigned long)g_time_boot);
     render_status_view();
 
     // Determine bootmode:
-    //  - User holds Button-Y at boot   → force BLE provisioning
+    //  - GP21 held LOW at boot          → force BLE provisioning
     //  - No valid creds in flash        → fall through to provisioning
     //  - Otherwise                      → normal WiFi/HTTPS boot
     sleep_ms(50);  // let GPIO pulls settle
