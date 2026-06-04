@@ -38,6 +38,16 @@
 // with a comfortable margin.
 #define REQ_BUF_SIZE        (20 * 1024)
 #define HTTPS_TIMEOUT_MS    20000
+
+// HTTP log verbosity: 0 = errors only, 1 = compact per-transfer lines,
+// 2 = full trace (header dump, ACK/poll/write chatter). Runtime-tunable.
+// Default 1: the level-2 lines run 1-2 KB per transfer, and pico-sdk stdio
+// serializes cores on one mutex — at 115200 baud a header dump holds it
+// for ~90 ms, stalling core0's mic pump past the ring cushion (measured
+// robo-voice cause). Errors always print regardless of level.
+extern volatile uint8_t g_http_log_level;
+#define HTTP_LOGI(...) do { if (g_http_log_level >= 1) printf(__VA_ARGS__); } while (0)
+#define HTTP_LOGV(...) do { if (g_http_log_level >= 2) printf(__VA_ARGS__); } while (0)
 // altcp_poll interval is in 500ms units; 4 = 2s
 #define HTTPS_POLL_INTERVAL 4
 

@@ -367,11 +367,21 @@ void audio_pause(void) {
 // ring's worth (~170 ms @ 24 kHz) of buffered audio first.
 void audio_resume(void) {
     if (!g_audio_ready || !g_audio_paused) return;
+    // Flush before re-enabling: anything buffered while paused is stale —
+    // the tail of whatever was playing at pause time, plus the end-of-
+    // session pad tts_play_pump writes into the frozen ring (observed as
+    // RESUME with buffered=4095, then ~256 ms of zombie audio). Zero the
+    // whole ring and snap the writer onto the DMA read position so resume
+    // is silence until fresh PCM lands. Safe here: resume runs on core0,
+    // the same side as every g_write_abs / wrap-tracker user.
+    uint32_t stale = (uint32_t)audio_stream_buffered();
+    memset(g_audio_buf, 0, sizeof g_audio_buf);
+    __sync_synchronize();
+    g_write_abs = dma_consumed_abs() & ~1u;
     pio_sm_clkdiv_restart(AUDIO_PIO, g_audio_sm);
     pio_sm_set_enabled(AUDIO_PIO, g_audio_sm, true);
     g_audio_paused = false;
-    printf("[audio] RESUME (buffered=%u frames)\n",
-           (unsigned)audio_stream_buffered());
+    printf("[audio] RESUME (flushed=%u stale frames)\n", (unsigned)stale);
 }
 
 bool audio_is_paused(void) { return g_audio_paused; }

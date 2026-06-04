@@ -29,7 +29,11 @@ int opus_stream_set_rate(uint32_t hz) {
         return -1;
     }
     g_decoder_sr = hz;
-    printf("[opus] decoder ready (%uHz mono, fixed-point)\n", (unsigned)hz);
+    // [stackdiag] exact heap cost of this decoder instance (mono). This is
+    // what opus_decoder_create() malloc()'d — compare against the encoder's
+    // and the free-heap probe to see how tight the newlib heap is.
+    printf("[opus] decoder ready (%uHz mono, fixed-point) heap=%d B\n",
+           (unsigned)hz, opus_decoder_get_size(1));
     return 0;
 }
 

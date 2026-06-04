@@ -14,8 +14,10 @@
  * the IC FIFO permanently. Audio stayed silent because forward_pump
  * eventually hit ic_send_avail=0 on every call.
  *
- * SCRATCH_Y is now unused on core0. Core1's stack (SCRATCH_X 4 KB,
- * .stack1_dummy) is unchanged — core1 no longer runs opus_decode.
+ * Core1's stack (.stack1_dummy, 4 KB) lives in SCRATCH_Y; SCRATCH_X is
+ * annexed by core0's stack (physically contiguous with RAM top), giving
+ * core0 20 KB (0x2007c000..0x20081000) at zero heap cost — opus_encode
+ * peaks at 18,912 B measured. Core1 no longer runs opus_decode.
  */
 
 MEMORY
@@ -208,16 +210,23 @@ SECTIONS
     } > SCRATCH_Y AT > FLASH
     __scratch_y_source__ = LOADADDR(.scratch_y);
 
-    /* Core 1's stack stays in SCRATCH_X (its size is bounded by
-     * PICO_CORE1_STACK_SIZE; core1 no longer runs opus_decode so
-     * its 4 KB budget is fine). */
+    /* Core 1's stack moves to SCRATCH_Y (was SCRATCH_X) so SCRATCH_X can
+     * be annexed by core0's stack below. Size is still bounded by
+     * PICO_CORE1_STACK_SIZE; core1 no longer runs opus_decode so its
+     * 4 KB budget is fine. */
     .stack1_dummy (NOLOAD):
     {
         *(.stack1*)
-    } > SCRATCH_X
+    } > SCRATCH_Y
 
-    /* Core 0's stack now lives at the top of main RAM. Heap grows up
-     * from __end__ toward __StackBottom; the ASSERT below catches
+    /* Core 0's stack tops out at the END of SCRATCH_X (0x20081000):
+     * SCRATCH_X (SRAM8) is physically contiguous with the top of main
+     * RAM, so annexing it buys 4 KB of stack WITHOUT lowering
+     * __StackBottom — i.e. zero cost to the newlib heap, whose break
+     * high-water (0x2007a000 measured) already sits only 8 KB below.
+     * Needed because opus_encode (SILK, VAR_ARRAYS) peaks core0's stack
+     * at 18,912 B measured — past the previous 16 KB region. Heap grows
+     * up from __end__ toward __StackBottom; the ASSERT below catches
      * collisions at link time. */
     .stack_dummy (NOLOAD):
     {
@@ -230,10 +239,12 @@ SECTIONS
         PROVIDE(__flash_binary_end = .);
     } > FLASH =0xaa
 
-    __StackOneTop = ORIGIN(SCRATCH_X) + LENGTH(SCRATCH_X);
+    __StackOneTop = ORIGIN(SCRATCH_Y) + LENGTH(SCRATCH_Y);
     __StackOneBottom = __StackOneTop - SIZEOF(.stack1_dummy);
 
-    __StackTop = ORIGIN(RAM) + LENGTH(RAM);
+    /* Top of SCRATCH_X, not top of RAM — see .stack_dummy comment. With
+     * PICO_STACK_SIZE=0x5000 this keeps __StackBottom at 0x2007c000. */
+    __StackTop = ORIGIN(SCRATCH_X) + LENGTH(SCRATCH_X);
     __StackBottom = __StackTop - SIZEOF(.stack_dummy);
     /* Heap must not grow into the relocated stack region. */
     __HeapLimit = __StackBottom;
@@ -255,6 +266,13 @@ SECTIONS
 
     /* Check that data + heap doesn't grow past the relocated stack base. */
     ASSERT(__StackBottom >= __end__, "region RAM overflowed: heap meets stack")
+
+    /* Core0's stack annexes SCRATCH_X, but the .scratch_x output section
+     * still targets that bank — the linker would NOT flag the overlap
+     * (the stack is only symbols, not a section). Refuse to link if
+     * anything ever lands in .scratch_x.*. */
+    ASSERT(__scratch_x_end__ == __scratch_x_start__,
+           ".scratch_x must stay empty: SCRATCH_X is annexed by core0's stack")
 
     ASSERT( __binary_info_header_end - __logical_binary_start <= 1024, "Binary info must be in first 1024 bytes of the binary")
     ASSERT( __embedded_block_end - __logical_binary_start <= 4096, "Embedded block must be in first 4096 bytes of the binary")

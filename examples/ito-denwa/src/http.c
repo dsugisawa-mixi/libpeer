@@ -41,6 +41,10 @@ volatile uint32_t      g_tts_sample_rate    = 24000;
 volatile uint32_t      g_recv_bytes        = 0;
 volatile uint32_t      g_recv_pkts         = 0;
 
+// See http.h: 0=errors, 1=compact (default), 2=full trace. Level 2 chatter
+// monopolizes the cross-core stdio mutex long enough to break mic capture.
+volatile uint8_t       g_http_log_level    = 1;
+
 bool                   g_https_chunked     = false;
 volatile bool          g_https_body_opus   = false;
 volatile size_t        g_chunked_read_pos  = 0;
@@ -253,8 +257,14 @@ static int parse_timeline_response(const char *body) {
 //=============================================================================
 void https_handle_done(void) {
     bool ok = (g_https_state == HC_DONE_OK);
-    printf("[https] done %s (mode=%d, %u bytes)\n",
-           ok ? "OK" : "ERR", (int)g_https_mode, (unsigned)g_https_resp_len);
+    if (ok) {
+        HTTP_LOGI("[https] done OK (mode=%d, %u bytes)\n",
+                  (int)g_https_mode, (unsigned)g_https_resp_len);
+    } else {
+        // Failures always print, whatever the log level.
+        printf("[https] done ERR (mode=%d, %u bytes)\n",
+               (int)g_https_mode, (unsigned)g_https_resp_len);
+    }
 
     if (ok && !g_https_headers_done) {
         const char *body = http_find_body(g_https_resp, g_https_resp_len);
@@ -368,10 +378,10 @@ void http_apply_tts_headers(void) {
     }
     g_tts_sample_rate = hz;
 
-    printf("[tts] sample_rate=%u chunked=%d opus=%d (X-Opus-SR=%.6s X-SR=%.6s)\n",
-           (unsigned)hz, (int)g_https_chunked, (int)g_https_body_opus,
-           sr_opus ? sr_opus : "(none)",
-           sr_plain ? sr_plain : "(none)");
+    HTTP_LOGV("[tts] sample_rate=%u chunked=%d opus=%d (X-Opus-SR=%.6s X-SR=%.6s)\n",
+              (unsigned)hz, (int)g_https_chunked, (int)g_https_body_opus,
+              sr_opus ? sr_opus : "(none)",
+              sr_plain ? sr_plain : "(none)");
 }
 
 void http_resp_compact_locked(void) {
@@ -409,21 +419,24 @@ static void http_check_complete(void) {
         // Dump the entire header section (bounded by body_start, not a fixed
         // 256 B window). The truncated dump used to hide X-Opus-Sample-Rate
         // and X-Source-Sample-Rate, which mattered when sample-rate
-        // negotiation went wrong.
-        size_t dump = g_https_body_start;
-        if (dump > sizeof(g_https_resp) - 1) dump = sizeof(g_https_resp) - 1;
-        char saved = g_https_resp[dump];
-        g_https_resp[dump] = '\0';
-        printf("[https] head:\n%s\n", g_https_resp);
-        g_https_resp[dump] = saved;
+        // negotiation went wrong. LOGV: ~1 KB on the wire = ~90 ms of stdio
+        // mutex at 115200 baud — fatal to mic capture if it lands mid-take.
+        if (g_http_log_level >= 2) {
+            size_t dump = g_https_body_start;
+            if (dump > sizeof(g_https_resp) - 1) dump = sizeof(g_https_resp) - 1;
+            char saved = g_https_resp[dump];
+            g_https_resp[dump] = '\0';
+            printf("[https] head:\n%s\n", g_https_resp);
+            g_https_resp[dump] = saved;
+        }
 
         const char *cl = http_find_header(g_https_resp, g_https_body_start, "Content-Length");
         if (cl) {
             g_https_content_len = atoi(cl);
-            printf("[https] Content-Length=%d body@%u\n",
-                   g_https_content_len, (unsigned)g_https_body_start);
+            HTTP_LOGV("[https] Content-Length=%d body@%u\n",
+                      g_https_content_len, (unsigned)g_https_body_start);
         } else {
-            printf("[https] no Content-Length (chunked?), will rely on FIN/timeout\n");
+            HTTP_LOGV("[https] no Content-Length (chunked?), will rely on FIN/timeout\n");
         }
         // True streaming for TTS: parse X-Sample-Rate / Transfer-Encoding
         // now so we know how to drive the I2S clock and how to read the
@@ -466,8 +479,8 @@ static void http_check_complete(void) {
     if (g_https_headers_done && g_https_content_len >= 0) {
         size_t body_have = g_https_resp_len - g_https_body_start;
         if ((int)body_have >= g_https_content_len) {
-            printf("[https] body complete (%u/%d)\n",
-                   (unsigned)body_have, g_https_content_len);
+            HTTP_LOGV("[https] body complete (%u/%d)\n",
+                      (unsigned)body_have, g_https_content_len);
             http_set_state(HC_DONE_OK);
         }
     }
@@ -479,8 +492,8 @@ static void http_check_complete(void) {
 static err_t https_poll_cb(void *arg, struct altcp_pcb *pcb) {
     (void)arg; (void)pcb;
     uint32_t elapsed = http_now_ms() - g_https_state_at;
-    printf("[https] poll: state=%d elapsed=%lums resp_len=%u\n",
-           (int)g_https_state, (unsigned long)elapsed, (unsigned)g_https_resp_len);
+    HTTP_LOGV("[https] poll: state=%d elapsed=%lums resp_len=%u\n",
+              (int)g_https_state, (unsigned long)elapsed, (unsigned)g_https_resp_len);
     if (elapsed > HTTPS_TIMEOUT_MS) {
         printf("[https] timeout in state %d\n", (int)g_https_state);
         http_set_state(HC_DONE_ERR);
@@ -501,8 +514,8 @@ static err_t https_recv_cb(void *arg, struct altcp_pcb *pcb, struct pbuf *p, err
     if (p == NULL || err != ERR_OK) {
         // Remote closed → we're done
         if (p) pbuf_free(p);
-        printf("[https] recv close (resp_len=%u err=%d)\n",
-               (unsigned)g_https_resp_len, err);
+        HTTP_LOGV("[https] recv close (resp_len=%u err=%d)\n",
+                  (unsigned)g_https_resp_len, err);
         http_set_state(HC_DONE_OK);
         return ERR_OK;
     }
@@ -543,9 +556,9 @@ static err_t https_connected_cb(void *arg, struct altcp_pcb *pcb, err_t err) {
         http_set_state(HC_DONE_ERR);
         return ERR_OK;
     }
-    printf("[https] TLS connected (after %lu ms), sending request (%u bytes, mode=%d)\n",
-           (unsigned long)(http_now_ms() - g_https_state_at),
-           (unsigned)g_https_req_len, (int)g_https_mode);
+    HTTP_LOGI("[https] TLS connected (after %lu ms), sending request (%u bytes, mode=%d)\n",
+              (unsigned long)(http_now_ms() - g_https_state_at),
+              (unsigned)g_https_req_len, (int)g_https_mode);
     // For POSTs, the body may follow the headers — send everything we've prebuilt.
     // mbedtls_ssl_write() caps each TLS record at MBEDTLS_SSL_OUT_CONTENT_LEN
     // (4096). The lwIP altcp_tls glue panics ("ret <= 0") if a single
@@ -568,7 +581,7 @@ static err_t https_connected_cb(void *arg, struct altcp_pcb *pcb, err_t err) {
         return werr;
     }
     err_t oerr = altcp_output(pcb);
-    printf("[https] write ok (%u B), output err=%d\n", (unsigned)g_https_req_len, oerr);
+    HTTP_LOGV("[https] write ok (%u B), output err=%d\n", (unsigned)g_https_req_len, oerr);
     http_set_state(HC_REQUESTING);
     return ERR_OK;
 }
@@ -577,10 +590,10 @@ static err_t https_connected_cb(void *arg, struct altcp_pcb *pcb, err_t err) {
 // GET never reached the server's TCP stack.
 static err_t https_sent_cb(void *arg, struct altcp_pcb *pcb, u16_t len) {
     (void)arg; (void)pcb;
-    printf("[https] sent ACK: %u bytes (elapsed=%lums in state=%d)\n",
-           len,
-           (unsigned long)(http_now_ms() - g_https_state_at),
-           (int)g_https_state);
+    HTTP_LOGV("[https] sent ACK: %u bytes (elapsed=%lums in state=%d)\n",
+              len,
+              (unsigned long)(http_now_ms() - g_https_state_at),
+              (int)g_https_state);
     return ERR_OK;
 }
 
@@ -678,8 +691,8 @@ int http_request_start(const ip_addr_t *ip, const char *host) {
     altcp_poll(g_https_pcb, https_poll_cb, HTTPS_POLL_INTERVAL);
 
     http_set_state(HC_CONNECTING);
-    printf("[https] connect %s:%d (%s) mode=%d\n",
-           host, HTTPS_PORT, ipaddr_ntoa(ip), (int)g_https_mode);
+    HTTP_LOGI("[https] connect %s:%d (%s) mode=%d\n",
+              host, HTTPS_PORT, ipaddr_ntoa(ip), (int)g_https_mode);
     err_t err = altcp_connect(g_https_pcb, ip, HTTPS_PORT, https_connected_cb);
     if (err != ERR_OK) {
         printf("[https] altcp_connect err=%d\n", err);

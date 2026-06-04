@@ -131,15 +131,19 @@ target_compile_definitions(${PRJ} PRIVATE
     # lockout victim was registered. In normal bootmode core1 is running
     # but never writes flash, so the assume-safe path is correct there too.
     PICO_FLASH_ASSUME_CORE1_SAFE=1
-    # Core 0's stack lives in main RAM (see memmap_bigstack.ld) so libopus
-    # SILK WB 20 ms fixed-point fits: pcm[480] frame buffer + ~3 KB SILK
-    # VLAs blow past SCRATCH_Y's 4 KB. 16 KB gives the decoder real
-    # headroom and leaves ~480 KB for everything else.
-    PICO_STACK_SIZE=0x4000
-    # Core 1 keeps its 4 KB SCRATCH_X budget — without this override
-    # PICO_CORE1_STACK_SIZE inherits PICO_STACK_SIZE (16 KB) and the
-    # linker fails because core1_stack[] is placed in SCRATCH_X.
-    # Core 1 no longer runs opus_decode so 4 KB is plenty.
+    # Core 0's stack: 20 KB ending at the top of SCRATCH_X (see
+    # memmap_bigstack.ld). opus is built with VAR_ARRAYS, so codec scratch
+    # is VLAs on the caller's stack; measured peaks (stackdiag canary):
+    # decode 4,864 B, encode 18,912 B — past the old 16 KB region.
+    # __StackBottom stays at 0x2007c000, so the extra 4 KB comes from the
+    # annexed SCRATCH_X bank, NOT the newlib heap (whose break high-water
+    # already ratchets to 8 KB below the bottom; lowering __StackBottom
+    # is what made PICO_STACK_SIZE=0x6000 kill WiFi in the past).
+    PICO_STACK_SIZE=0x5000
+    # Core 1's 4 KB stack lives in SCRATCH_Y (was SCRATCH_X, now annexed
+    # by core0) — without this override PICO_CORE1_STACK_SIZE inherits
+    # PICO_STACK_SIZE and the linker fails because core1_stack[] no
+    # longer fits the 4 KB bank. Core 1 doesn't run opus so 4 KB is fine.
     PICO_CORE1_STACK_SIZE=0x1000
 )
 

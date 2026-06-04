@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <unistd.h>   // sbrk(0) — newlib heap break probe (stackdiag)
 
 #include "pico/stdlib.h"
 #include "hardware/uart.h"
@@ -53,6 +54,83 @@
 // core1's network_init() once both cores are up.
 //=============================================================================
 static wifi_creds_t g_wifi_creds;
+
+//=============================================================================
+// STACKDIAG — measurement-only instrumentation (no behavior change).
+//
+// Goal: pick a core0 stack size that fits the opus ENCODER (mic) without
+// starving the shared newlib heap that cyw43/lwIP/mbedtls allocate from.
+// __HeapLimit == __StackBottom, so stack and heap fight over the same RAM;
+// growing PICO_STACK_SIZE shrinks the heap 1:1 (that's why 0x6000 broke WiFi).
+// These three probes give the real numbers so we stop guessing:
+//   (A) opus_{encoder,decoder}_get_size — printed in mic.c / opus_stream.c
+//   (B) free-heap probe after network is up   — stackdiag_heap_report()
+//   (C) core0 stack high-water via canary paint — stackdiag_paint/hiwater()
+//=============================================================================
+#define STACK_CANARY 0xC5C5C5C5u
+// How far BELOW __StackBottom the canary paint extends. The 16 KB stack
+// region pegged at hiwater=16384/16384 during mic encode (opus is built
+// with VAR_ARRAYS — all SILK scratch is VLAs on the caller's stack), so
+// the real peak is somewhere past the bottom. The area below is the newlib
+// heap's growth gap (break was 84 KB below __StackBottom at net-ready);
+// painting its top 16 KB is safe as long as the break never climbs that
+// high — stackdiag checks sbrk(0) at paint and scan time and degrades to
+// the in-region measurement if it does. This measures the overflow depth
+// WITHOUT raising PICO_STACK_SIZE (which has history: 0x6000 broke WiFi).
+#define STACKDIAG_GAP_PAINT (16u * 1024u)
+// Linker-provided region bounds (see memmap_bigstack.ld).
+extern char __StackBottom[];
+extern char __StackTop[];
+extern char __HeapLimit[];
+
+// Lowest address the canary paint/scan may touch: 16 KB below the stack
+// region, clamped to the live heap break (+1 KB guard) if it's already up
+// there. Recomputed at scan time so heap growth can only shrink the probed
+// window, never let the scan read heap-owned bytes as "stack usage".
+static uintptr_t stackdiag_floor(void) {
+    uintptr_t floor = (uintptr_t)__StackBottom - STACKDIAG_GAP_PAINT;
+    uintptr_t brk_guard = ((uintptr_t)sbrk(0) + 1024u + 3u) & ~3u;
+    return (brk_guard > floor) ? brk_guard : floor;
+}
+
+// Paint the unused part of core0's stack with a known pattern so we can later
+// find how deep it was ever used. Call ONCE, early in main(), while the stack
+// is still shallow (SP near __StackTop) so almost the whole region is painted.
+// Leaves a 256 B guard below the live SP so we never scribble the live frame.
+static void stackdiag_paint(void) {
+    uintptr_t sp;
+    __asm volatile ("mov %0, sp" : "=r"(sp));
+    uint32_t *p   = (uint32_t *)stackdiag_floor();
+    uint32_t *end = (uint32_t *)((sp - 256) & ~3u);
+    while (p < end) *p++ = STACK_CANARY;
+}
+
+// Scan from the floor up; the first word that is no longer the canary marks
+// the deepest the stack has ever reached. Returns peak bytes used (depth from
+// __StackTop) — values ABOVE the region size mean the stack overflowed into
+// the gap below __StackBottom by that excess. Monotonic across the run —
+// captures encode AND decode peaks.
+static size_t stackdiag_hiwater(void) {
+    const uint32_t *p   = (const uint32_t *)stackdiag_floor();
+    const uint32_t *top = (const uint32_t *)(uintptr_t)__StackTop;
+    while (p < top && *p == STACK_CANARY) p++;
+    return (size_t)((const char *)top - (const char *)p);
+}
+
+// Report newlib-heap availability at a given moment. growable = how far the
+// break can still rise toward __HeapLimit — an UPPER BOUND on what a single
+// malloc (e.g. altcp_tls_new's ~16 KB record buffer) can still get; free-list
+// holes below the break may allow a bit more. sbrk(0) only reads the current
+// break, so this never allocates — important because pico_malloc's wrapper
+// (PICO_MALLOC_PANIC, default ON) panics on a failed malloc, so probing the
+// limit with real allocations would itself be the OOM crash.
+static void stackdiag_heap_report(const char *when) {
+    uintptr_t brk      = (uintptr_t)sbrk(0);
+    size_t    growable = (size_t)((uintptr_t)__HeapLimit - brk);
+    printf("[stackdiag] heap @%s: break=0x%08x limit=0x%08x growable=%u B\n",
+           when, (unsigned)brk, (unsigned)(uintptr_t)__HeapLimit,
+           (unsigned)growable);
+}
 
 //=============================================================================
 // Inter-core state machine — types and shared state
@@ -112,6 +190,9 @@ static bool     g_core1_lp_session_active = false;
 // fresh TLS handshake (~100 ms CPU + a few KB of traffic), so this is the
 // main lever for trading off latency vs. load. 10 s gives a relaxed debug-
 // friendly cadence; drop to 2–3 s for a more "real" walkie-talkie feel.
+// NOTE: short intervals keep the device almost always mid-playback, so
+// pressing B to record collides with in-flight RX (audio PAUSE/RESUME +
+// throttled drain). 10 s leaves silent gaps so recording lands in silence.
 #define LP_POLL_INTERVAL_MS  10000
 static uint32_t g_core1_lp_last_poll_ms = 0;
 // Operator id of the current linephone session — pinned into GET URL so the
@@ -170,6 +251,11 @@ static void on_core1_network(void) {
         HALT();
     }
     set_status("Net: ready");
+    // STACKDIAG (B): the moment of truth for the heap budget — cyw43 + lwIP +
+    // the WiFi association are all up, but no TLS handshake has run yet. The
+    // largest_malloc figure here is roughly what the first altcp_tls_new has
+    // to find. Compare against the encoder/decoder heap sizes to see headroom.
+    stackdiag_heap_report("net-ready");
     printf("[core1] S0 done → notify core0 NET_READY\n");
     ic_send(IC_MSG_NET_READY, NULL, 0);
     g_core1_state = CORE1_S_WAIT_AUDIO;
@@ -195,7 +281,16 @@ static void on_core1_running(void) {
     // Forward decoded PCM from g_https_resp → core0 via the ic_ring
     tts_forward_pump();
 
-    bool https_busy = (g_https_state != HC_IDLE) || g_tts_play_active;
+    // mic_is_active(): while the user holds push-to-talk, defer ALL new
+    // transport kicks (lp GET poll, lab fetch, radio/TTS POSTs, timeline).
+    // A TLS handshake monopolizes core1 for ~200+ ms, during which the IC
+    // ring isn't drained and mic frames get dropped ([mic] ship-block —
+    // measured 10/205 frames lost on a 4 s take). In-flight transfers
+    // still complete via cyw43_arch_poll; the post-release POST is not
+    // affected because g_mic_active is already false by the time
+    // LINEPHONE_POST_END arrives.
+    bool https_busy = (g_https_state != HC_IDLE) || g_tts_play_active
+                      || mic_is_active();
 
     // Lab-list fetch (Button-X / auto-fetch)
     if (g_core1_fetch_pending && !https_busy) {
@@ -638,6 +733,41 @@ static void on_core0_running(void) {
                (unsigned long)now, (int)g_view, (int)g_lab_state,
                g_lab_count, g_lab_selected, (int)g_timeline_active);
     }
+
+    // STACKDIAG (C): peak core0 stack usage so far. Own timer (prints even
+    // while tts_busy / recording — that's exactly when the encoder/decoder
+    // push the stack deepest). Monotonic, so the max after a record+playback
+    // cycle is the number we size PICO_STACK_SIZE against.
+    static uint32_t last_sd = 0;
+    if ((now - last_sd) >= 2000) {
+        last_sd = now;
+        size_t used  = stackdiag_hiwater();
+        size_t total = (size_t)((uintptr_t)__StackTop - (uintptr_t)__StackBottom);
+        if (used > total) {
+            // Peak ran past __StackBottom into the heap-growth gap. "spill"
+            // is how far — the number PICO_STACK_SIZE is short by. If spill
+            // pegs at the probe window (gap paint fully consumed), the true
+            // peak is even deeper: ">= spill".
+            printf("[stackdiag] core0 stack OVERFLOW hiwater=%u B region=%u "
+                   "spill=%u B (probe window %u) brk=0x%08x mic=%d\n",
+                   (unsigned)used, (unsigned)total, (unsigned)(used - total),
+                   (unsigned)((uintptr_t)__StackBottom - stackdiag_floor()),
+                   (unsigned)(uintptr_t)sbrk(0), (int)mic_is_active());
+            // Fingerprint the writer: dump 8 words at the deepest non-canary
+            // point. Real stack frames carry flash return addresses
+            // (0x10xxxxxx) and RAM pointers (0x20xxxxxx); a rogue audio/DMA
+            // writer leaves 16-bit-sample-looking words instead.
+            const uint32_t *deep = (const uint32_t *)
+                ((uintptr_t)__StackTop - used);
+            printf("[stackdiag] @%p:", (const void *)deep);
+            for (int i = 0; i < 8; i++) printf(" %08x", (unsigned)deep[i]);
+            printf("\n");
+        } else {
+            printf("[stackdiag] core0 stack hiwater=%u/%u B (free=%u) mic=%d\n",
+                   (unsigned)used, (unsigned)total, (unsigned)(total - used),
+                   (int)mic_is_active());
+        }
+    }
     // 1 ms (was 10 ms): the previous cadence let the IC ring fill for up to
     // ~10 ms before tts_play_pump drained it, which made core1's ic_send block
     // on a full ring → opus decode latency ballooned (max_us hit 265 ms in
@@ -770,6 +900,14 @@ int main() {
     g_time_boot = board_millis();
     printf("\n\n=== RP2350 HTTPS + PicoLCD-1.3 ===\n");
     printf("[TIMING] Boot complete: %lu ms\n", (unsigned long)g_time_boot);
+
+    // STACKDIAG (C): paint core0's stack now, while it's shallow, so the
+    // high-water scan in on_core0_running() can report the deepest the opus
+    // encoder/decoder ever pushed it. Measurement only — no behavior change.
+    stackdiag_paint();
+    printf("[stackdiag] stack region: bottom=0x%08x top=0x%08x total=%u B\n",
+           (unsigned)(uintptr_t)__StackBottom, (unsigned)(uintptr_t)__StackTop,
+           (unsigned)((uintptr_t)__StackTop - (uintptr_t)__StackBottom));
 
     lcd_init();
     buttons_init();

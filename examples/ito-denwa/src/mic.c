@@ -27,23 +27,49 @@
 #define MIC_SD_PIN       21
 
 //=============================================================================
-// Opus encoder config — lowest reasonable voice quality
+// Opus encoder config — voice quality vs PTT length trade-off
 //   - VOIP application, SILK-only at 16 kHz
-//   - 8 kbps CBR → ~20 bytes per 20 ms frame
-//   - complexity 0 → cheapest CPU
+//   - 16 kbps CBR → ~40 bytes per 20 ms frame (8 kbps sounded audibly
+//     gritty/hissy on echo playback; 16 kbps is SILK's comfortable floor
+//     for WB voice). NOTE: halves the max PTT take vs 8 kbps —
+//     LP_OPUS_CAP (12 KB) now fills in ~5.6 s; [lp/accum] logs drops.
+//   - complexity 0 → cheapest CPU (do NOT raise: core0 stack hiwater is
+//     18,912/20,480 B during encode — only ~1.5 KB headroom)
 //=============================================================================
-#define MIC_OPUS_BITRATE     8000
+#define MIC_OPUS_BITRATE     16000
 #define MIC_OPUS_COMPLEXITY  0
-#define MIC_OPUS_MAX_PKT     128    // generous upper bound for 8 kbps × 20 ms
+#define MIC_OPUS_MAX_PKT     128    // generous upper bound for 16 kbps × 20 ms
+
+//=============================================================================
+// Digital mic gain. The INMP441 is rated -26 dBFS @ 94 dB SPL, so normal
+// speech at conversational distance lands around -50..-35 dBFS — a few
+// hundred counts after the >>16 extraction (measured: mean|s|=436,
+// [mic/dump] showed ±150 mid-take while speaking). That encodes to a
+// near-inaudible whisper. Shift the full 24-bit sample up ×2^MIC_GAIN_SHIFT
+// with saturation; clips are counted and reported in the STOP summary.
+// ×8 hard-clipped audibly on plosives/breath pops at handset distance
+// (raw peaks ±12-21 K × 8 ≫ 32767), so: ×4 gain + a 4:1 soft knee above
+// ±24576 instead of hard saturation — overshoot up to ~57 K compresses
+// smoothly, only beyond that hard-caps (counted as clips). Tune with the
+// STOP stats: aim mean|s| ≈ 1500-6000, clips ≈ 0.
+//=============================================================================
+#define MIC_GAIN_SHIFT   2      // ×4 vs plain >>16 extraction
+#define MIC_KNEE         24576  // soft-knee threshold (post-gain)
+#define MIC_KNEE_HEADROOM 8191  // knee output range above threshold (→32767)
 
 //=============================================================================
 // PIO RX ring (DMA writes 32-bit words here, two per stereo frame).
 // 1024 words = 4 KB; ~32 ms cushion @ 16 kHz stereo capture, easily covers
 // the main loop's 1 ms tick.
 //=============================================================================
-#define MIC_RING_WORDS   1024
+// 2048 words = 8 KB; ~64 ms cushion @ 16 kHz stereo capture. Was 1024/32 ms,
+// but core0's loop provably stalls past 32 ms at times (measured 25% sample
+// loss on a 2.5 s take: pump gaps lap the ring AND alias the modulo delta in
+// mic_dma_produced_abs(), so the loss was silent). The pump-gap stats printed
+// at STOP verify whether 64 ms is enough.
+#define MIC_RING_WORDS   2048
 #define MIC_RING_BYTES   (MIC_RING_WORDS * 4)
-#define MIC_RING_BITS    12         // log2(MIC_RING_BYTES)
+#define MIC_RING_BITS    13         // log2(MIC_RING_BYTES)
 
 static uint32_t __attribute__((aligned(MIC_RING_BYTES))) g_mic_ring[MIC_RING_WORDS];
 
@@ -65,6 +91,15 @@ static uint32_t g_mic_read_abs      = 0;
 static uint32_t g_mic_last_ring_pos = 0;
 static uint32_t g_mic_produced_abs  = 0;
 
+// Pump-cadence diagnostics: the modulo-delta in mic_dma_produced_abs()
+// silently aliases when a pump gap exceeds one ring period (samples vanish
+// uncounted — measured 25% loss with the old 32 ms ring), so track the gaps
+// and report worst-case + overrun count at STOP.
+static uint32_t g_mic_start_ms      = 0;
+static uint32_t g_mic_pump_last_ms  = 0;
+static uint32_t g_mic_pump_max_gap  = 0;
+static uint32_t g_mic_overruns      = 0;
+
 // Per-recording PCM-level diagnostics. CBR Opus hides silence-vs-speech, so
 // inspect the raw samples directly to tell a live mic from a dead/stuck line:
 //   peak ~0                  → no signal (mic unpowered / SD not wired)
@@ -76,6 +111,17 @@ static uint32_t g_mic_dbg_or    = 0;       // OR of raw 16-bit samples
 static uint32_t g_mic_dbg_and   = 0xFFFF;  // AND of raw 16-bit samples
 static uint32_t g_mic_dbg_n     = 0;       // samples seen
 static uint64_t g_mic_dbg_absum = 0;       // sum of |sample| → mean level
+
+// One-shot per-take waveform dumps, chasing the "STOP stats look alive but
+// the encoded packets decode to silence" failure: the raw ring words show
+// which channel slot carries data and where the 24-bit field sits (a
+// tri-stated slot dragged around by the GP21 pull-up can fake signal-like
+// min/max stats); the extracted PCM shows the waveform the encoder actually
+// sees (voice = smooth/correlated; bit-misalignment = broadband garbage;
+// subsonic or Nyquist-heavy artifacts = silence after SILK's filters).
+static bool g_mic_dump_raw_done;
+static bool g_mic_dump_pcm_done;
+static uint32_t g_mic_dbg_clips = 0;       // samples saturated by MIC_GAIN_SHIFT
 
 bool mic_is_active(void) { return g_mic_active; }
 
@@ -125,11 +171,17 @@ int mic_init(void) {
     opus_encoder_ctl(g_mic_enc, OPUS_SET_INBAND_FEC(0));
     opus_encoder_ctl(g_mic_enc, OPUS_SET_DTX(0));
     opus_encoder_ctl(g_mic_enc, OPUS_SET_FORCE_CHANNELS(1));
+    // Tried NARROWBAND here hoping to shrink SILK's VAR_ARRAYS stack VLAs:
+    // no effect (encode peak 18,744 B WB cap vs 18,912 B NB cap, stackdiag
+    // measured) — at 8 kbps CBR the encoder already picks NB internally,
+    // so neither cap binds. The real fix is the 20 KB core0 stack
+    // (memmap_bigstack.ld annexes SCRATCH_X).
     opus_encoder_ctl(g_mic_enc, OPUS_SET_MAX_BANDWIDTH(OPUS_BANDWIDTH_WIDEBAND));
 
-    printf("[mic] ready: pio=%p sm=%d dma_ch=%d enc=%p (16k mono VOIP %d bps)\n",
+    printf("[mic] ready: pio=%p sm=%d dma_ch=%d enc=%p (16k mono VOIP %d bps) "
+           "heap=%d B\n",
            (void*)MIC_PIO, g_mic_sm, g_mic_dma_ch, (void*)g_mic_enc,
-           MIC_OPUS_BITRATE);
+           MIC_OPUS_BITRATE, opus_encoder_get_size(1));
     return 0;
 }
 
@@ -171,6 +223,9 @@ void mic_start(void) {
     g_mic_dbg_and   = 0xFFFF;
     g_mic_dbg_n     = 0;
     g_mic_dbg_absum = 0;
+    g_mic_dump_raw_done = false;
+    g_mic_dump_pcm_done = false;
+    g_mic_dbg_clips     = 0;
 
     // Configure pins as PIO function. i2s_in_program_init also sets pindirs.
     i2s_in_program_init(MIC_PIO, g_mic_sm, g_mic_pio_off,
@@ -183,6 +238,10 @@ void mic_start(void) {
     g_mic_read_abs      = 0;
     g_mic_last_ring_pos = 0;
     g_mic_produced_abs  = 0;
+    g_mic_start_ms      = board_millis();
+    g_mic_pump_last_ms  = g_mic_start_ms;
+    g_mic_pump_max_gap  = 0;
+    g_mic_overruns      = 0;
 
     // DMA: read PIO RX FIFO into ring, ENDLESS write-side ring wrap.
     dma_channel_config cfg = dma_channel_get_default_config(g_mic_dma_ch);
@@ -227,13 +286,30 @@ void mic_stop(void) {
 
     // Report the captured PCM level so we can tell a live mic from a dead line.
     uint32_t mean = g_mic_dbg_n ? (uint32_t)(g_mic_dbg_absum / g_mic_dbg_n) : 0;
-    printf("[mic] STOP — pcm: n=%lu min=%ld max=%ld mean|s|=%lu or=%04lx and=%04lx%s\n",
+    printf("[mic] STOP — pcm: n=%lu min=%ld max=%ld mean|s|=%lu clips=%lu "
+           "or=%04lx and=%04lx%s\n",
            (unsigned long)g_mic_dbg_n,
            (long)g_mic_dbg_min, (long)g_mic_dbg_max,
            (unsigned long)mean,
+           (unsigned long)g_mic_dbg_clips,
            (unsigned long)(g_mic_dbg_or  & 0xFFFF),
            (unsigned long)(g_mic_dbg_and & 0xFFFF),
            (g_mic_dbg_max - g_mic_dbg_min < 64) ? "  <-- FLAT/NO SIGNAL" : "");
+
+    // Capture-integrity summary: expected samples from wall clock vs actually
+    // pumped. loss > ~2% or overruns > 0 → the ring cushion was breached
+    // (robo-voice); check max_gap to see how long core0 stalled.
+    uint32_t dur_ms = board_millis() - g_mic_start_ms;
+    uint32_t expect = dur_ms * (MIC_SAMPLE_RATE_HZ / 1000u);
+    uint32_t loss   = (expect > g_mic_dbg_n)
+                      ? (uint32_t)((uint64_t)(expect - g_mic_dbg_n) * 100u / expect)
+                      : 0;
+    printf("[mic] capture: dur=%lums expect~%lu got=%lu loss=%lu%% "
+           "max_pump_gap=%lums overruns=%lu (ring=%ums)\n",
+           (unsigned long)dur_ms, (unsigned long)expect,
+           (unsigned long)g_mic_dbg_n, (unsigned long)loss,
+           (unsigned long)g_mic_pump_max_gap, (unsigned long)g_mic_overruns,
+           (unsigned)(MIC_RING_WORDS / 32u));
 }
 
 //=============================================================================
@@ -267,7 +343,36 @@ static void mic_ship_frame(void) {
 void mic_pump(void) {
     if (!g_mic_active) return;
 
+    // Stall watch: DMA produces 32 words/ms, so a pump gap of one ring
+    // period (MIC_RING_WORDS/32 ms) or more means the writer lapped the
+    // reader and mic_dma_produced_abs()'s modulo delta aliased — samples
+    // are gone and uncounted. Can't recover them; record the event so the
+    // STOP summary shows whether the ring cushion is still being breached.
+    uint32_t now_ms = board_millis();
+    uint32_t gap    = now_ms - g_mic_pump_last_ms;
+    g_mic_pump_last_ms = now_ms;
+    if (gap > g_mic_pump_max_gap) g_mic_pump_max_gap = gap;
+    if (gap >= MIC_RING_WORDS / 32u) g_mic_overruns++;
+
     uint32_t produced = mic_dma_produced_abs();
+
+    // Raw slot dump, once per take, ~32 ms in (skip the spin-up frames).
+    // One UART line ≈ 160 B ≈ 14 ms @115200 — inside the 64 ms ring cushion.
+    if (!g_mic_dump_raw_done && produced >= 1024u
+        && g_mic_read_abs + 16u <= produced) {
+        g_mic_dump_raw_done = true;
+        printf("[mic/dump] raw (L,R)x8 @abs=%lu:",
+               (unsigned long)g_mic_read_abs);
+        for (int i = 0; i < 16; i += 2) {
+            printf(" %08lx,%08lx",
+                   (unsigned long)g_mic_ring[(g_mic_read_abs + (uint32_t)i)
+                                             & (MIC_RING_WORDS - 1)],
+                   (unsigned long)g_mic_ring[(g_mic_read_abs + (uint32_t)i + 1)
+                                             & (MIC_RING_WORDS - 1)]);
+        }
+        printf("\n");
+    }
+
     while (g_mic_read_abs + 2u <= produced) {
         // Consume one stereo frame (2 words: left, right). PIO autopush is
         // MSB-first (shift_left), so each word holds a left-justified 16-bit
@@ -277,7 +382,25 @@ void mic_pump(void) {
         (void)            g_mic_ring[(g_mic_read_abs + 1)    & (MIC_RING_WORDS - 1)];
         g_mic_read_abs += 2;
 
-        int16_t s = (int16_t)(left_word >> 16);
+        // Full 24-bit sample lives in bits [31:8]; arithmetic >>8 sign-
+        // extends it. Apply digital gain (see MIC_GAIN_SHIFT) — plain >>16
+        // truncation leaves conversational speech ~40 dB below full scale.
+        int32_t s24 = (int32_t)left_word >> 8;
+        int32_t amp = s24 >> (8 - MIC_GAIN_SHIFT);
+        // Soft knee: linear to ±MIC_KNEE, then 4:1 compression of the
+        // overshoot into the remaining headroom; hard cap (counted) only
+        // past ~±57 K. Keeps plosives from turning into square waves.
+        int32_t mag = amp < 0 ? -amp : amp;
+        if (mag > MIC_KNEE) {
+            int32_t over = (mag - MIC_KNEE) >> 2;
+            if (over > MIC_KNEE_HEADROOM) {
+                over = MIC_KNEE_HEADROOM;
+                g_mic_dbg_clips++;
+            }
+            mag = MIC_KNEE + over;
+            amp = (amp < 0) ? -mag : mag;
+        }
+        int16_t s = (int16_t)amp;
 
         // PCM-level diagnostics (see g_mic_dbg_* declarations).
         uint32_t raw = (uint32_t)(uint16_t)s;
@@ -293,5 +416,17 @@ void mic_pump(void) {
             mic_ship_frame();
             g_mic_pcm_acc_len = 0;
         }
+    }
+
+    // PCM waveform dump, once per take, ~1 s in (well past spin-up, while
+    // the user is presumably speaking). 32 consecutive samples = 2 ms.
+    if (!g_mic_dump_pcm_done && g_mic_dbg_n >= 16000u
+        && g_mic_pcm_acc_len >= 32u) {
+        g_mic_dump_pcm_done = true;
+        printf("[mic/dump] pcm x32 @n=%lu:", (unsigned long)g_mic_dbg_n);
+        for (size_t i = g_mic_pcm_acc_len - 32u; i < g_mic_pcm_acc_len; i++) {
+            printf(" %d", (int)g_mic_pcm_acc[i]);
+        }
+        printf("\n");
     }
 }
