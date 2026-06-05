@@ -56,11 +56,11 @@ Three zones, fully separated.
 
 The two RP2350 cores are fully separated, forming the audio pipeline without any mutex.
 
-| | Core 0 (16 KB stack) | Core 1 (4 KB stack) |
+| | Core 0 (20 KB stack) | Core 1 (4 KB stack) |
 |---|---|---|
-| **Role** | Audio / UI / Opus Decode | Network / Transport / Forwarding |
-| **Stack location** | Main RAM top | SCRATCH_X |
-| **Heavy work** | opus_decode (SILK VLA ~3 KB) | TLS handshake / cyw43_arch_poll |
+| **Role** | Audio / UI / Opus Encode & Decode | Network / Transport / Forwarding |
+| **Stack location** | Main RAM top + SCRATCH_X (annexed) | SCRATCH_Y |
+| **Heavy work** | opus_encode (SILK VLA peak 18.9 KB) | TLS handshake / cyw43_arch_poll |
 | **Loop cadence** | 1 ms | 500 μs |
 | **IC direction** | Consumer (audio data) | Producer (opus pkt / PCM chunk) |
 
@@ -86,7 +86,27 @@ Downstream uses a large DMA ring (32 KB) to absorb jitter for realtime continuou
     <img src="images/stack_layout.svg" style="max-width:70%; height:auto;" />
 </div>
 
-Core 0's stack is relocated from the SDK default SCRATCH_Y (4 KB) to **16 KB at the top of Main RAM**. The libopus SILK WB 20 ms fixed-point decoder consumes ~3 KB via VLA, overflowing SCRATCH_Y. The heap ceiling is set by `__StackBottom`. Core 1 stays on SCRATCH_X 4 KB since it does not run Opus decoding.
+RP2350 has two dedicated 4 KB SRAM banks — **SCRATCH_X** and **SCRATCH_Y** — separate from Main RAM (512 KB). The SDK defaults place Core 0's stack in SCRATCH_Y and Core 1's in SCRATCH_X, allowing each core to access its own bank without bus contention.
+
+However, the Opus (SILK fixed-point) encoder heavily uses **VLA (Variable Length Arrays)**, which are allocated on the stack, not the heap. During a single `opus_encode` call the stack grows to a measured peak of **18,912 bytes** (decode side is 4,864 B) — far exceeding the default 4 KB.
+
+To solve this, Core 0's stack is extended to **20 KB spanning Main RAM top (0x2007c000) through the end of SCRATCH_X (0x20081000)**. Because these regions are physically contiguous they can be annexed as a single block at zero heap cost. The heap ceiling is set by `__StackBottom`. Core 1 gives up SCRATCH_X and moves to **SCRATCH_Y (4 KB)** — sufficient for TLS / Wi-Fi processing alone.
+
+### How the stack peak was measured
+
+On an MCU with no MMU and no OS-level stack guard pages, a stack overflow silently corrupts the heap or return addresses — the symptom is a hang or a bizarre crash far from the actual cause. Measuring the true peak is essential before choosing a stack size, but RP2350 has no hardware watchpoint support for memory ranges. The firmware uses a **canary-paint high-water mark** technique built into `main.c`:
+
+1. **Paint** — At boot, while the stack is still shallow, `stackdiag_paint()` fills the entire stack region (and a 16 KB probe window below `__StackBottom` into the heap gap) with a known canary word (`0xC5C5C5C5`). A 256 B guard below the live SP prevents overwriting the current frame.
+
+2. **Scan** — Every 2 seconds during the main loop, `stackdiag_hiwater()` scans upward from the floor until it finds the first non-canary word. The distance from `__StackTop` to that point is the peak usage so far — covering both `opus_encode` and `opus_decode` peaks across the entire run.
+
+3. **Overflow detection** — If the high-water mark exceeds the stack region size, the overflow depth ("spill") is reported along with a hex dump of the 8 deepest words. Flash return addresses (`0x10xxxxxx`) vs RAM pointers (`0x20xxxxxx`) vs sample-like values fingerprint whether the corruption came from a real call chain or a rogue DMA write.
+
+4. **Heap probe** — `stackdiag_heap_report()` reads `sbrk(0)` (the current heap break) and reports how much room remains before the heap collides with `__StackBottom`. This catches the opposite failure mode: raising `PICO_STACK_SIZE` too far shrinks the heap 1:1, and mbedTLS's `altcp_tls_new` alone needs a ~16 KB record buffer — `0x6000` (24 KB) stack broke Wi-Fi because the heap ran out.
+
+5. **Static size probes** — `opus_encoder_get_size(1)` and `opus_decoder_get_size(1)` are printed at init to show the heap-allocated state size (separate from the VLA stack cost).
+
+The combination of (A) static size probes, (B) heap break monitoring, and (C) canary-paint high-water scanning made it possible to converge on 20 KB: the smallest size that fits `opus_encode`'s 18,912 B measured peak while leaving enough heap for TLS.
 
 ---
 
@@ -111,12 +131,21 @@ Given CYW43's Wi-Fi throughput and RP2350's processing headroom, Opus compressio
 | MCU | RP2350 dual-core 200 MHz | $7 class, realtime Opus decoding capable |
 | Wi-Fi | CYW43 (Pico 2 W) | Always-on TLS |
 | TLS | mbedTLS | HTTPS / WSS |
-| Codec | Opus (SILK fixed-point) | Low-bandwidth high-quality, 16–24 kHz mono |
+| Codec (decode) | Opus (SILK fixed-point) 24 kHz mono | Cloud → MCU streaming playback |
+| Codec (encode) | Opus (SILK fixed-point) 16 kHz mono 16 kbps | MCU → Cloud push-to-talk upload |
 | Audio Out | PIO I2S → PCM5101A DAC | DMA ring 32 KB, ENDLESS mode |
-| Audio In | PIO I2S MIC | Push-to-talk voice capture |
+| Audio In | PIO I2S RX ← INMP441 MEMS mic | DMA ring 8 KB, Opus encode on Core 0 |
 | IC Bus | SPSC ring + HW FIFO | lock-free, zero-copy |
 | Provisioning | BLE (BTstack) | Zero-touch setup via iOS app |
 | Display | ST7789 1.3" LCD | Status display + control UI |
+
+---
+
+## Wiring
+
+<div style="text-align:center; width:80%; box-sizing:border-box;">
+    <img src="images/rp2350-wired_bb.png" style="max-width:70%; height:auto;" />
+</div>
 
 ---
 
