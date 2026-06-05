@@ -1,0 +1,158 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 720" font-family="'Helvetica Neue', Arial, sans-serif">
+  <defs>
+    <filter id="shadow" x="-2%" y="-2%" width="104%" height="104%">
+      <feDropShadow dx="1" dy="2" stdDeviation="3" flood-opacity="0.12"/>
+    </filter>
+    <linearGradient id="bgGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#f8fafc"/>
+      <stop offset="100%" stop-color="#f1f5f9"/>
+    </linearGradient>
+    <linearGradient id="deviceGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#e2e8f0"/>
+      <stop offset="100%" stop-color="#cbd5e1"/>
+    </linearGradient>
+    <linearGradient id="d1Grad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#7c3aed"/>
+      <stop offset="100%" stop-color="#6d28d9"/>
+    </linearGradient>
+    <linearGradient id="rpGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#0284c7"/>
+      <stop offset="100%" stop-color="#0369a1"/>
+    </linearGradient>
+    <linearGradient id="core0Grad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#059669"/>
+      <stop offset="100%" stop-color="#047857"/>
+    </linearGradient>
+    <linearGradient id="core1Grad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#d97706"/>
+      <stop offset="100%" stop-color="#b45309"/>
+    </linearGradient>
+    <linearGradient id="micGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#dc2626"/>
+      <stop offset="100%" stop-color="#b91c1c"/>
+    </linearGradient>
+    <linearGradient id="lcdGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#6366f1"/>
+      <stop offset="100%" stop-color="#4f46e5"/>
+    </linearGradient>
+    <linearGradient id="cloudGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#2563eb"/>
+      <stop offset="100%" stop-color="#1d4ed8"/>
+    </linearGradient>
+    <linearGradient id="phoneGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#16a34a"/>
+      <stop offset="100%" stop-color="#15803d"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Background -->
+  <rect width="900" height="720" rx="12" fill="url(#bgGrad)"/>
+
+  <!-- Device enclosure -->
+  <rect x="40" y="30" width="820" height="460" rx="16" fill="url(#deviceGrad)" filter="url(#shadow)"/>
+  <rect x="40" y="30" width="820" height="460" rx="16" fill="none" stroke="#94a3b8" stroke-width="1.5"/>
+  <text x="450" y="68" text-anchor="middle" fill="#1e293b" font-size="18" font-weight="700" letter-spacing="2">USB-C Audio Sentinel</text>
+  <rect x="330" y="76" width="240" height="1" fill="#94a3b8"/>
+
+  <!-- D1 SED Module -->
+  <rect x="70" y="110" width="180" height="160" rx="12" fill="url(#d1Grad)" filter="url(#shadow)"/>
+  <text x="160" y="142" text-anchor="middle" fill="#fff" font-size="15" font-weight="700">D1 SED Module</text>
+  <rect x="90" y="154" width="140" height="1" fill="#a78bfa" opacity="0.5"/>
+  <text x="160" y="178" text-anchor="middle" fill="#e9d5ff" font-size="11">Sound Event Detection</text>
+  <text x="160" y="210" text-anchor="middle" fill="#ede9fe" font-size="11">内蔵 MIC</text>
+  <text x="160" y="230" text-anchor="middle" fill="#ede9fe" font-size="11">内蔵 AI (edge inference)</text>
+  <text x="160" y="256" text-anchor="middle" fill="#fef08a" font-size="10" font-weight="600">常時リスニング ∙ mW オーダー</text>
+
+  <!-- UART arrow D1 → RP2350 -->
+  <line x1="250" y1="190" x2="340" y2="190" stroke="#b45309" stroke-width="2.5" stroke-dasharray="6,3"/>
+  <polygon points="340,185 352,190 340,195" fill="#b45309"/>
+  <text x="296" y="180" text-anchor="middle" fill="#92400e" font-size="10" font-weight="600">UART</text>
+  <text x="296" y="205" text-anchor="middle" fill="#475569" font-size="9">event label</text>
+  <text x="296" y="217" text-anchor="middle" fill="#475569" font-size="9">+ confidence</text>
+
+  <!-- RP2350 main box -->
+  <rect x="355" y="100" width="390" height="290" rx="12" fill="url(#rpGrad)" filter="url(#shadow)"/>
+  <text x="550" y="130" text-anchor="middle" fill="#fff" font-size="15" font-weight="700">RP2350 (Pico 2 W)</text>
+  <rect x="400" y="138" width="300" height="1" fill="#7dd3fc" opacity="0.4"/>
+  <text x="550" y="158" text-anchor="middle" fill="#e0f2fe" font-size="10">bare-metal ∙ cold boot ~2 秒 ∙ 攻撃面ゼロ</text>
+
+  <!-- Core 0 -->
+  <rect x="385" y="175" width="160" height="130" rx="10" fill="url(#core0Grad)" filter="url(#shadow)"/>
+  <text x="465" y="200" text-anchor="middle" fill="#fff" font-size="13" font-weight="700">Core 0</text>
+  <text x="465" y="220" text-anchor="middle" fill="#d1fae5" font-size="10">Audio / UI</text>
+  <text x="465" y="240" text-anchor="middle" fill="#d1fae5" font-size="10">Opus Encode</text>
+  <text x="465" y="260" text-anchor="middle" fill="#d1fae5" font-size="10">UART RX Parse</text>
+  <text x="465" y="285" text-anchor="middle" fill="#ecfdf5" font-size="9" font-weight="600">20 KB stack</text>
+
+  <!-- Core 1 -->
+  <rect x="570" y="175" width="150" height="130" rx="10" fill="url(#core1Grad)" filter="url(#shadow)"/>
+  <text x="645" y="200" text-anchor="middle" fill="#fff" font-size="13" font-weight="700">Core 1</text>
+  <text x="645" y="220" text-anchor="middle" fill="#fef3c7" font-size="10">Network</text>
+  <text x="645" y="240" text-anchor="middle" fill="#fef3c7" font-size="10">TLS / Wi-Fi</text>
+  <text x="645" y="260" text-anchor="middle" fill="#fef3c7" font-size="10">cyw43_arch_poll</text>
+  <text x="645" y="285" text-anchor="middle" fill="#fffbeb" font-size="9" font-weight="600">4 KB stack</text>
+
+  <!-- SPSC ring arrow -->
+  <line x1="545" y1="240" x2="570" y2="240" stroke="#fbbf24" stroke-width="2"/>
+  <polygon points="567,236 575,240 567,244" fill="#fbbf24"/>
+  <text x="557" y="228" text-anchor="middle" fill="#fef3c7" font-size="8" font-weight="600">SPSC</text>
+  <text x="557" y="256" text-anchor="middle" fill="#fef3c7" font-size="8" font-weight="600">ring</text>
+
+  <!-- DMA label below cores -->
+  <rect x="400" y="320" width="330" height="50" rx="8" fill="#0c4a6e" opacity="0.7"/>
+  <text x="565" y="340" text-anchor="middle" fill="#e0f2fe" font-size="10">I2S RX DMA → Opus encode → SPSC ring → TLS POST</text>
+  <text x="565" y="358" text-anchor="middle" fill="#7dd3fc" font-size="9" font-weight="600">イベント検知時のみ稼働 ∙ Opus 16 kbps (PCM 比 93.75% 削減)</text>
+
+  <!-- INMP441 -->
+  <rect x="70" y="310" width="180" height="80" rx="12" fill="url(#micGrad)" filter="url(#shadow)"/>
+  <text x="160" y="340" text-anchor="middle" fill="#fff" font-size="13" font-weight="700">INMP441</text>
+  <text x="160" y="360" text-anchor="middle" fill="#fecaca" font-size="10">MEMS MIC</text>
+  <text x="160" y="378" text-anchor="middle" fill="#fee2e2" font-size="9">I2S RX → Core 0</text>
+
+  <!-- I2S arrow MIC → RP2350 -->
+  <line x1="250" y1="350" x2="383" y2="280" stroke="#ef4444" stroke-width="2"/>
+  <polygon points="379,275 389,280 381,286" fill="#ef4444"/>
+  <text x="305" y="300" text-anchor="middle" fill="#991b1b" font-size="10" font-weight="600">I2S RX</text>
+
+  <!-- LCD -->
+  <rect x="70" y="420" width="180" height="55" rx="12" fill="url(#lcdGrad)" filter="url(#shadow)"/>
+  <text x="160" y="447" text-anchor="middle" fill="#fff" font-size="13" font-weight="700">ST7789 LCD</text>
+  <text x="160" y="465" text-anchor="middle" fill="#e0e7ff" font-size="10">状態表示 (optional)</text>
+
+  <!-- SPI arrow LCD → RP2350 -->
+  <line x1="250" y1="440" x2="383" y2="370" stroke="#818cf8" stroke-width="1.5" stroke-dasharray="4,3"/>
+  <polygon points="379,365 389,370 381,376" fill="#818cf8"/>
+  <text x="305" y="396" text-anchor="middle" fill="#4338ca" font-size="9">SPI</text>
+
+  <!-- Wi-Fi arrow down from RP2350 -->
+  <line x1="550" y1="390" x2="550" y2="520" stroke="#3b82f6" stroke-width="2.5"/>
+  <polygon points="544,517 550,530 556,517" fill="#3b82f6"/>
+  <text x="575" y="460" fill="#1e40af" font-size="11" font-weight="600">Wi-Fi (TLS)</text>
+  <text x="575" y="478" fill="#475569" font-size="9">Opus packets</text>
+  <text x="575" y="493" fill="#475569" font-size="9">+ event metadata</text>
+
+  <!-- Cloud -->
+  <rect x="430" y="540" width="240" height="70" rx="16" fill="url(#cloudGrad)" filter="url(#shadow)"/>
+  <text x="550" y="572" text-anchor="middle" fill="#fff" font-size="15" font-weight="700">Cloud</text>
+  <text x="550" y="594" text-anchor="middle" fill="#dbeafe" font-size="10">relay + storage (GPU/CDN 不要)</text>
+
+  <!-- Arrow Cloud → Phone -->
+  <line x1="550" y1="610" x2="550" y2="645" stroke="#22c55e" stroke-width="2.5"/>
+  <polygon points="544,642 550,655 556,642" fill="#22c55e"/>
+
+  <!-- Phone notification -->
+  <rect x="440" y="660" width="220" height="45" rx="12" fill="url(#phoneGrad)" filter="url(#shadow)"/>
+  <text x="550" y="686" text-anchor="middle" fill="#fff" font-size="13" font-weight="700">スマホ通知</text>
+  <text x="550" y="700" text-anchor="middle" fill="#dcfce7" font-size="9">「玄関でガラス破壊音を検知」+ 音声</text>
+
+  <!-- Timeline callout -->
+  <rect x="680" y="440" width="160" height="120" rx="10" fill="#f8fafc" filter="url(#shadow)"/>
+  <rect x="680" y="440" width="160" height="120" rx="10" fill="none" stroke="#cbd5e1" stroke-width="1"/>
+  <text x="760" y="462" text-anchor="middle" fill="#b45309" font-size="11" font-weight="700">タイムライン</text>
+  <text x="760" y="482" text-anchor="middle" fill="#334155" font-size="9">0.0s  D1 検知</text>
+  <text x="760" y="497" text-anchor="middle" fill="#334155" font-size="9">0.3s  Opus 開始</text>
+  <text x="760" y="512" text-anchor="middle" fill="#334155" font-size="9">1.8s  TLS 確立</text>
+  <text x="760" y="527" text-anchor="middle" fill="#15803d" font-size="9" font-weight="700">2.0s  証拠クラウド到達</text>
+  <text x="760" y="547" text-anchor="middle" fill="#dc2626" font-size="9">5.0s  デバイス破壊</text>
+  <text x="760" y="557" text-anchor="middle" fill="#dc2626" font-size="9">       → もう遅い</text>
+</svg>

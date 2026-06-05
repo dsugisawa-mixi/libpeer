@@ -80,7 +80,7 @@ Downstream uses a large DMA ring (32 KB) to absorb jitter for realtime continuou
 
 ---
 
-## Memory Layout
+## SRAM Budget Diagnosis — Running Opus + TLS + Wi-Fi on RP2350
 
 <div style="text-align:center; width:80%; box-sizing:border-box;">
     <img src="images/stack_layout.svg" style="max-width:70%; height:auto;" />
@@ -90,11 +90,34 @@ RP2350 has two dedicated 4 KB SRAM banks — **SCRATCH_X** and **SCRATCH_Y** —
 
 However, the Opus (SILK fixed-point) encoder heavily uses **VLA (Variable Length Arrays)**, which are allocated on the stack, not the heap. During a single `opus_encode` call the stack grows to a measured peak of **18,912 bytes** (decode side is 4,864 B) — far exceeding the default 4 KB.
 
-To solve this, Core 0's stack is extended to **20 KB spanning Main RAM top (0x2007c000) through the end of SCRATCH_X (0x20081000)**. Because these regions are physically contiguous they can be annexed as a single block at zero heap cost. The heap ceiling is set by `__StackBottom`. Core 1 gives up SCRATCH_X and moves to **SCRATCH_Y (4 KB)** — sufficient for TLS / Wi-Fi processing alone.
+To solve this, a **custom linker script `memmap_bigstack.ld`** replaces the SDK default (`memmap_default.ld`) with the following relocations:
 
-### How the stack peak was measured
+- `.stack_dummy` moved from SCRATCH_Y → **RAM** section (places Core 0's stack in Main RAM top)
+- `.stack1_dummy` moved from SCRATCH_X → **SCRATCH_Y** (evacuates Core 1's stack)
+- `__StackTop` set to `ORIGIN(SCRATCH_X) + LENGTH(SCRATCH_X)` = 0x20081000 (annexes SCRATCH_X)
+- `__HeapLimit = __StackBottom` explicitly defined (pins the heap ceiling to the stack bottom)
 
-On an MCU with no MMU and no OS-level stack guard pages, a stack overflow silently corrupts the heap or return addresses — the symptom is a hang or a bizarre crash far from the actual cause. Measuring the true peak is essential before choosing a stack size, but RP2350 has no hardware watchpoint support for memory ranges. The firmware uses a **canary-paint high-water mark** technique built into `main.c`:
+This extends Core 0's stack to **20 KB spanning Main RAM top (0x2007c000) through the end of SCRATCH_X (0x20081000)**. Because these regions are physically contiguous they can be annexed as a single block, and the 4 KB from SCRATCH_X adds to the stack without reducing the heap. Core 1 gives up SCRATCH_X and moves to **SCRATCH_Y (4 KB)** — Core 1 does not run Opus, and the cyw43 / lwIP / mbedTLS call chains are shallow (their heavy buffer allocations come from `malloc` on the shared Main RAM heap), so a 4 KB stack is sufficient.
+
+### Three probes that determined the SRAM budget
+
+On an MCU with no MMU and no OS-level stack guard pages, a stack overflow silently corrupts the heap or return addresses — the symptom is a hang or a bizarre crash far from the actual cause. RP2350 has no hardware watchpoint support for memory ranges. The following three probes were combined to converge on the SRAM budget.
+
+#### A. `opus_encoder_get_size` / `opus_decoder_get_size` — static Opus state sizing
+
+`opus_encoder_get_size(1)` and `opus_decoder_get_size(1)` are printed at init to reveal the contiguous memory size required for the Opus encoder/decoder state. When using `opus_encoder_create()` / `opus_decoder_create()`, this state is internally `malloc`'d — making it a **fixed heap-side cost** (alternatively, `opus_encoder_init()` / `opus_decoder_init()` allow placing the state in a static region or custom arena). This firmware uses `create`, so one encoder alone takes ~11 KB from the heap — before growing the stack, you must first confirm the heap can absorb this.
+
+#### B. `sbrk(0)` heap break monitoring — TLS / Wi-Fi / malloc headroom
+
+`stackdiag_heap_report()` reads `sbrk(0)` (the current heap break) and reports how much room remains before the heap collides with `__StackBottom` (= `__HeapLimit`). This probe detects the **reverse failure mode: growing the stack too far kills the heap**.
+
+In this custom linker script (`memmap_bigstack.ld`), `__HeapLimit = __StackBottom` is intentionally defined so that the portion of Core 0's stack that extends into Main RAM eats into the heap 1:1 (however, the 4 KB annexed from SCRATCH_X adds to the stack without reducing the heap). Raising `PICO_STACK_SIZE` pushes `__StackBottom` down, shrinking the heap ceiling. mbedTLS's `altcp_tls_new` alone needs a ~16 KB record buffer via `malloc` — when that runs out, Wi-Fi silently dies. When `0x6000` (24 KB) was tried, this probe showed the break-to-limit gap had shrunk below 8 KB, pinpointing the OOM cause.
+
+Note: `PICO_MALLOC_PANIC` (SDK default: ON) panics when `malloc` returns NULL, but `sbrk(0)` is read-only — **the probe itself cannot trigger an OOM crash**.
+
+#### C. Canary-paint high-water scan — runtime VLA / call stack peak measurement
+
+A canary-paint high-water mark technique built into `main.c`:
 
 1. **Paint** — At boot, while the stack is still shallow, `stackdiag_paint()` fills the entire stack region (and a 16 KB probe window below `__StackBottom` into the heap gap) with a known canary word (`0xC5C5C5C5`). A 256 B guard below the live SP prevents overwriting the current frame.
 
@@ -102,11 +125,60 @@ On an MCU with no MMU and no OS-level stack guard pages, a stack overflow silent
 
 3. **Overflow detection** — If the high-water mark exceeds the stack region size, the overflow depth ("spill") is reported along with a hex dump of the 8 deepest words. Flash return addresses (`0x10xxxxxx`) vs RAM pointers (`0x20xxxxxx`) vs sample-like values fingerprint whether the corruption came from a real call chain or a rogue DMA write.
 
-4. **Heap probe** — `stackdiag_heap_report()` reads `sbrk(0)` (the current heap break) and reports how much room remains before the heap collides with `__StackBottom`. This catches the opposite failure mode: raising `PICO_STACK_SIZE` too far shrinks the heap 1:1, and mbedTLS's `altcp_tls_new` alone needs a ~16 KB record buffer — `0x6000` (24 KB) stack broke Wi-Fi because the heap ran out.
+This probe measured the `opus_encode` peak at **18,912 bytes**.
 
-5. **Static size probes** — `opus_encoder_get_size(1)` and `opus_decoder_get_size(1)` are printed at init to show the heap-allocated state size (separate from the VLA stack cost).
+#### Conclusion: 20 KB derived from three constraints
 
-The combination of (A) static size probes, (B) heap break monitoring, and (C) canary-paint high-water scanning made it possible to converge on 20 KB: the smallest size that fits `opus_encode`'s 18,912 B measured peak while leaving enough heap for TLS.
+| Probe | What it measures | Value obtained |
+|---|---|---|
+| A. `opus_*_get_size` | Heap fixed cost | encoder ~11 KB, decoder ~8 KB |
+| B. `sbrk(0)` | Heap headroom | ~8 KB remaining at net-ready |
+| C. canary-paint | Runtime stack peak | `opus_encode` 18,912 B / `opus_decode` 4,864 B |
+
+- C shows the stack needs at least 18,912 B + headroom
+- B shows `__StackBottom` cannot move any lower without starving TLS
+- A confirms the heap-side fixed costs are already accounted for
+
+→ Annexing SCRATCH_X to reach **20 KB without reducing the heap** is the only layout that satisfies all three constraints simultaneously.
+
+### Stabilization — what went wrong along the way
+
+On an MCU without MMU or stack guard pages, a stack overflow does not segfault — it silently corrupts adjacent memory. The symptom is never "stack overflow"; it is "audio stopped", "Wi-Fi died", or "the device hung for no apparent reason". Every step toward the final 20 KB layout was a blind experiment where the cause and the symptom were far apart.
+
+**Phase 1 — SCRATCH_Y 4 KB (SDK default)**
+
+The initial firmware ran `opus_decode` on Core 0 with the SDK-default 4 KB stack in SCRATCH_Y. SILK's VLA consumed ~3 KB, and together with `pcm[480]` (960 B on stack at the time) and the call chain, it silently overflowed. The `handle_core0_notify` dispatcher's return address was corrupted — it never returned, permanently wedging the IC FIFO. Core 1's `forward_pump` hit `ic_send_avail == 0` on every call and stopped shipping audio. The only visible symptom: **audio stayed silent**, with no error, no crash, no log.
+
+Diagnosis required adding the canary-paint instrumentation, which revealed the stack was pegged at 4,096/4,096 B — clearly overflowing without any way to see how far.
+
+**Phase 2 — Main RAM 16 KB (`PICO_STACK_SIZE=0x4000`)**
+
+Custom linker script `memmap_bigstack.ld` relocated Core 0's stack to Main RAM top, giving it 16 KB. `pcm[]` was also moved to `static` to remove 960 B from the stack. `opus_decode` stabilized — canary showed ~4,864 B peak, well within 16 KB.
+
+Then push-to-talk mic capture was added, bringing `opus_encode` onto Core 0. The canary immediately pegged at 16,384/16,384 — the encode peak exceeded the region. But since the canary only measures within the region, the true depth was unknown.
+
+**Phase 3 — Main RAM 24 KB (`PICO_STACK_SIZE=0x6000`): Wi-Fi died**
+
+Raising the stack to 24 KB should have solved the overflow. It did — but `__StackBottom` moved down by 8 KB, shrinking the heap by the same amount. mbedTLS's `altcp_tls_new` needs a ~16 KB record buffer via `malloc`; with the heap ceiling lowered, the TLS handshake OOM'd and Wi-Fi silently failed to connect. `PICO_MALLOC_PANIC` (SDK default: ON) would have panic'd — but only if `malloc` returned NULL; lwIP's internal allocator path doesn't always trigger it.
+
+The `stackdiag_heap_report` probe showed the heap break was already within 8 KB of `__HeapLimit` at net-ready — confirming there was no room to give.
+
+**Phase 4 — Main RAM 16 KB + SCRATCH_X annexed = 20 KB (`PICO_STACK_SIZE=0x5000`)**
+
+The insight: Main RAM top (0x20080000) and SCRATCH_X (0x20080000–0x20081000) are physically contiguous. By moving Core 1's stack from SCRATCH_X to SCRATCH_Y and claiming SCRATCH_X as the top 4 KB of Core 0's stack, the linker produces a 20 KB region (0x207c000–0x20081000) without moving `__StackBottom` down at all — **zero heap cost**.
+
+Canary scan with the extended probe window (16 KB below `__StackBottom`) finally revealed the true peak: **18,912 B** for `opus_encode`. 20 KB leaves ~1.5 KB headroom. Heap report confirmed the break stayed well below the limit. Wi-Fi and TLS remained stable.
+
+**Other memory sizing traps encountered along the way:**
+
+| What | Symptom | Root cause | Fix |
+|---|---|---|---|
+| IC ring 64 KB × 2 | cJSON OOM on 70 KB lab list | 128 KB BSS starved heap | Reduced to 32 KB × 2 |
+| `g_https_resp` 128 KB | `altcp_tls_new` OOM | +188 KB BSS pushed heap past limit | Tuned to fit within BSS budget |
+| `pcm[480]` on stack | Silent audio hang | 960 B + VLA exceeded SCRATCH_Y | Moved to `static` |
+| `opus_encoder_create` | Heap pressure | ~11 KB heap alloc per encoder | Accepted; verified with `sbrk(0)` probe |
+
+The general pattern: on a 520 KB MCU, **stack, heap, and BSS are a zero-sum game**. Fixing one overflow creates another unless all three are measured simultaneously. The canary-paint + heap-break + BSS-size triple probe was not optional — it was the only way to navigate the constraint space without trial-and-error in the dark.
 
 ---
 

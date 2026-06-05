@@ -1,0 +1,148 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 680" font-family="'Helvetica Neue', Arial, sans-serif">
+  <defs>
+    <filter id="shadow" x="-2%" y="-2%" width="104%" height="104%">
+      <feDropShadow dx="1" dy="2" stdDeviation="3" flood-opacity="0.12"/>
+    </filter>
+    <linearGradient id="bgGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#f8fafc"/>
+      <stop offset="100%" stop-color="#f1f5f9"/>
+    </linearGradient>
+    <linearGradient id="d1Grad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#7c3aed"/>
+      <stop offset="100%" stop-color="#6d28d9"/>
+    </linearGradient>
+    <linearGradient id="rpGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#0284c7"/>
+      <stop offset="100%" stop-color="#0369a1"/>
+    </linearGradient>
+    <linearGradient id="micGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#dc2626"/>
+      <stop offset="100%" stop-color="#b91c1c"/>
+    </linearGradient>
+    <linearGradient id="core0Grad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#059669"/>
+      <stop offset="100%" stop-color="#047857"/>
+    </linearGradient>
+    <linearGradient id="core1Grad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#d97706"/>
+      <stop offset="100%" stop-color="#b45309"/>
+    </linearGradient>
+    <linearGradient id="cloudGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#2563eb"/>
+      <stop offset="100%" stop-color="#1d4ed8"/>
+    </linearGradient>
+    <linearGradient id="phoneGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#16a34a"/>
+      <stop offset="100%" stop-color="#15803d"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Background -->
+  <rect width="720" height="680" rx="12" fill="url(#bgGrad)"/>
+
+  <!-- Title -->
+  <text x="360" y="38" text-anchor="middle" fill="#1e293b" font-size="16" font-weight="700" letter-spacing="1">動作フロー — イベント検知から通知まで</text>
+
+  <!-- Step 1: D1 Detection -->
+  <rect x="200" y="60" width="320" height="60" rx="14" fill="url(#d1Grad)" filter="url(#shadow)"/>
+  <text x="360" y="85" text-anchor="middle" fill="#fff" font-size="14" font-weight="700">D1 で異常音検知</text>
+  <text x="360" y="108" text-anchor="middle" fill="#e9d5ff" font-size="11">内蔵 MIC + エッジ AI が常時リスニング</text>
+
+  <!-- Arrow 1→2 with UART label -->
+  <line x1="360" y1="120" x2="360" y2="155" stroke="#b45309" stroke-width="2.5"/>
+  <polygon points="354,152 360,165 366,152" fill="#b45309"/>
+  <rect x="395" y="128" width="200" height="22" rx="6" fill="#fef3c7"/>
+  <rect x="395" y="128" width="200" height="22" rx="6" fill="none" stroke="#d97706" stroke-width="0.5"/>
+  <text x="495" y="143" text-anchor="middle" fill="#92400e" font-size="11" font-weight="600">UART: "glassbreak, 0.92"</text>
+
+  <!-- Step 2: RP2350 wakeup -->
+  <rect x="200" y="170" width="320" height="60" rx="14" fill="url(#rpGrad)" filter="url(#shadow)"/>
+  <text x="360" y="195" text-anchor="middle" fill="#fff" font-size="14" font-weight="700">RP2350 を起こす / イベント通知</text>
+  <text x="360" y="218" text-anchor="middle" fill="#e0f2fe" font-size="11">GPIO 割り込み or UART RX 受信</text>
+
+  <!-- Arrow 2→3 -->
+  <line x1="360" y1="230" x2="360" y2="265" stroke="#ef4444" stroke-width="2.5"/>
+  <polygon points="354,262 360,275 366,262" fill="#ef4444"/>
+
+  <!-- Step 3: INMP441 capture -->
+  <rect x="200" y="280" width="320" height="60" rx="14" fill="url(#micGrad)" filter="url(#shadow)"/>
+  <text x="360" y="305" text-anchor="middle" fill="#fff" font-size="14" font-weight="700">INMP441 で音声キャプチャ</text>
+  <text x="360" y="328" text-anchor="middle" fill="#fee2e2" font-size="11">I2S RX DMA → 検知後数秒分を取得</text>
+
+  <!-- Arrow 3→4 -->
+  <line x1="360" y1="340" x2="360" y2="375" stroke="#22c55e" stroke-width="2.5"/>
+  <polygon points="354,372 360,385 366,372" fill="#22c55e"/>
+
+  <!-- Step 4: Core 0 Opus encode -->
+  <rect x="200" y="390" width="150" height="60" rx="14" fill="url(#core0Grad)" filter="url(#shadow)"/>
+  <text x="275" y="415" text-anchor="middle" fill="#fff" font-size="13" font-weight="700">Core 0</text>
+  <text x="275" y="438" text-anchor="middle" fill="#d1fae5" font-size="11">Opus encode 16 kbps</text>
+
+  <!-- SPSC arrow Core0 → Core1 -->
+  <line x1="350" y1="420" x2="370" y2="420" stroke="#d97706" stroke-width="2.5"/>
+  <polygon points="367,414 380,420 367,426" fill="#d97706"/>
+  <text x="360" y="408" text-anchor="middle" fill="#92400e" font-size="9" font-weight="600">SPSC ring</text>
+
+  <!-- Step 5: Core 1 TLS -->
+  <rect x="385" y="390" width="135" height="60" rx="14" fill="url(#core1Grad)" filter="url(#shadow)"/>
+  <text x="452" y="415" text-anchor="middle" fill="#fff" font-size="13" font-weight="700">Core 1</text>
+  <text x="452" y="438" text-anchor="middle" fill="#fef3c7" font-size="11">TLS でクラウド送信</text>
+
+  <!-- Arrow 5→6 -->
+  <line x1="360" y1="450" x2="360" y2="485" stroke="#3b82f6" stroke-width="2.5"/>
+  <polygon points="354,482 360,495 366,482" fill="#3b82f6"/>
+  <rect x="395" y="458" width="210" height="22" rx="6" fill="#dbeafe"/>
+  <rect x="395" y="458" width="210" height="22" rx="6" fill="none" stroke="#93c5fd" stroke-width="0.5"/>
+  <text x="500" y="473" text-anchor="middle" fill="#1e40af" font-size="11">Opus packets + event metadata</text>
+
+  <!-- Step 6: Cloud -->
+  <rect x="200" y="500" width="320" height="60" rx="14" fill="url(#cloudGrad)" filter="url(#shadow)"/>
+  <text x="360" y="525" text-anchor="middle" fill="#fff" font-size="14" font-weight="700">Cloud: イベント種別 + 音声を保存</text>
+  <text x="360" y="548" text-anchor="middle" fill="#dbeafe" font-size="11">relay + storage (GPU/CDN 不要)</text>
+
+  <!-- Arrow 6→7 -->
+  <line x1="360" y1="560" x2="360" y2="595" stroke="#22c55e" stroke-width="2.5"/>
+  <polygon points="354,592 360,605 366,592" fill="#22c55e"/>
+
+  <!-- Step 7: Phone notification -->
+  <rect x="200" y="610" width="320" height="55" rx="14" fill="url(#phoneGrad)" filter="url(#shadow)"/>
+  <text x="360" y="634" text-anchor="middle" fill="#fff" font-size="14" font-weight="700">スマホ通知</text>
+  <text x="360" y="654" text-anchor="middle" fill="#dcfce7" font-size="11">「玄関でガラス破壊音を検知」+ 音声再生</text>
+
+  <!-- Timeline on the left -->
+  <rect x="30" y="60" width="130" height="400" rx="10" fill="#f8fafc" filter="url(#shadow)"/>
+  <rect x="30" y="60" width="130" height="400" rx="10" fill="none" stroke="#cbd5e1" stroke-width="1"/>
+  <text x="95" y="82" text-anchor="middle" fill="#b45309" font-size="11" font-weight="700">タイムライン</text>
+  <line x1="50" y1="92" x2="140" y2="92" stroke="#e2e8f0" stroke-width="1"/>
+
+  <!-- Timeline dots and labels -->
+  <circle cx="60" cy="115" r="5" fill="#7c3aed"/>
+  <text x="72" y="119" fill="#1e293b" font-size="10" font-weight="600">0.0 秒</text>
+  <text x="72" y="133" fill="#64748b" font-size="9">D1 検知</text>
+
+  <line x1="60" y1="120" x2="60" y2="168" stroke="#cbd5e1" stroke-width="1" stroke-dasharray="3,3"/>
+  <circle cx="60" cy="175" r="5" fill="#0284c7"/>
+  <text x="72" y="179" fill="#1e293b" font-size="10" font-weight="600">0.0 秒</text>
+  <text x="72" y="193" fill="#64748b" font-size="9">RP2350 割り込み</text>
+
+  <line x1="60" y1="180" x2="60" y2="228" stroke="#cbd5e1" stroke-width="1" stroke-dasharray="3,3"/>
+  <circle cx="60" cy="235" r="5" fill="#dc2626"/>
+  <text x="72" y="239" fill="#1e293b" font-size="10" font-weight="600">0.1 秒</text>
+  <text x="72" y="253" fill="#64748b" font-size="9">I2S DMA 開始</text>
+
+  <line x1="60" y1="240" x2="60" y2="288" stroke="#cbd5e1" stroke-width="1" stroke-dasharray="3,3"/>
+  <circle cx="60" cy="295" r="5" fill="#059669"/>
+  <text x="72" y="299" fill="#1e293b" font-size="10" font-weight="600">0.3 秒</text>
+  <text x="72" y="313" fill="#64748b" font-size="9">Opus 開始</text>
+
+  <line x1="60" y1="300" x2="60" y2="348" stroke="#cbd5e1" stroke-width="1" stroke-dasharray="3,3"/>
+  <circle cx="60" cy="355" r="5" fill="#d97706"/>
+  <text x="72" y="359" fill="#1e293b" font-size="10" font-weight="600">1.8 秒</text>
+  <text x="72" y="373" fill="#64748b" font-size="9">TLS 確立</text>
+
+  <line x1="60" y1="360" x2="60" y2="408" stroke="#cbd5e1" stroke-width="1" stroke-dasharray="3,3"/>
+  <circle cx="60" cy="415" r="5" fill="#16a34a"/>
+  <text x="72" y="419" fill="#15803d" font-size="10" font-weight="700">2.0 秒</text>
+  <text x="72" y="433" fill="#15803d" font-size="9" font-weight="600">証拠クラウド到達</text>
+  <text x="72" y="447" fill="#dc2626" font-size="9">→ 壊されても、もう遅い</text>
+</svg>

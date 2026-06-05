@@ -79,7 +79,7 @@ Core 間通信は **64 KB の SPSC ring buffer + HW FIFO notify (8 slot)**。バ
 
 ---
 
-## メモリレイアウト
+## RP2350 で Opus + TLS + Wi-Fi を同時成立させるための SRAM 配分診断
 
 <div style="text-align:center; width:80%; box-sizing:border-box;">
     <img src="images/stack_layout.svg" style="max-width:70%; height:auto;" />
@@ -89,23 +89,95 @@ RP2350 は Main RAM (512 KB) とは別に **SCRATCH_X / SCRATCH_Y** という 4 
 
 しかし Opus (SILK fixed-point) のエンコーダは内部で **VLA (Variable Length Array)** を多用し、これはヒープではなくスタック上に確保される。関数呼び出し中にスタックが一気に膨らみ、実測で `opus_encode` が **18,912 B** をピーク消費する（デコード側は 4,864 B）。デフォルトの 4 KB では到底足りない。
 
-そこで Core 0 のスタックを **Main RAM top (0x2007c000) 〜 SCRATCH_X 末尾 (0x20081000) の 20 KB** に拡張。物理的に隣接しているため連続領域として併合でき、ヒープコストはゼロ。heap 上限は `__StackBottom` で切る。Core 1 は SCRATCH_X を明け渡し **SCRATCH_Y (4 KB)** に移動 — TLS / Wi-Fi 処理のみなので 4 KB で十分。
+そこで SDK デフォルトのリンカスクリプト (`memmap_default.ld`) を置き換える**カスタムリンカスクリプト `memmap_bigstack.ld`** を作成し、以下の再配置を行った:
 
-### スタックピークの計測方法
+- `.stack_dummy` を SCRATCH_Y → **RAM** セクションへ移動（Core 0 スタックを Main RAM top に配置）
+- `.stack1_dummy` を SCRATCH_X → **SCRATCH_Y** へ移動（Core 1 スタックの退避先）
+- `__StackTop` を `ORIGIN(SCRATCH_X) + LENGTH(SCRATCH_X)` = 0x20081000 に設定（SCRATCH_X 併合）
+- `__HeapLimit = __StackBottom` を明示的に定義（ヒープ上限をスタック底に一致させる）
 
-MMU もスタックガードページもない MCU では、スタックオーバーフローはヒープやリターンアドレスを無言で破壊する — ハングや見当違いのクラッシュとして現れ、原因特定が極めて困難。RP2350 にはメモリ範囲のハードウェアウォッチポイントもないため、ファームウェアに **canary-paint 方式のハイウォーターマーク計測** を組み込んでいる（`main.c`）:
+これにより Core 0 のスタックは **Main RAM top (0x2007c000) 〜 SCRATCH_X 末尾 (0x20081000) の 20 KB** に拡張される。Main RAM と SCRATCH_X は物理的に隣接しているため連続領域として併合でき、SCRATCH_X 分の 4 KB はヒープを削らずにスタック容量へ加算できる。Core 1 は SCRATCH_X を明け渡し **SCRATCH_Y (4 KB)** に移動 — Core 1 は Opus を実行せず、cyw43 / lwIP / mbedTLS のコールチェーン自体は浅い（重いバッファ確保は Main RAM の共有ヒープから malloc されるため）ので、スタック 4 KB で足りる。
+
+### SRAM 配分を決めた 3 つの計測手段
+
+MMU もスタックガードページもない MCU では、スタックオーバーフローはヒープやリターンアドレスを無言で破壊する — ハングや見当違いのクラッシュとして現れ、原因特定が極めて困難。RP2350 にはメモリ範囲のハードウェアウォッチポイントもないため、以下の 3 つのプローブを組み合わせて SRAM 配分を収束させた。
+
+#### A. `opus_encoder_get_size` / `opus_decoder_get_size` — Opus state の静的サイズ把握
+
+`opus_encoder_get_size(1)` / `opus_decoder_get_size(1)` を init 時に出力し、Opus encoder/decoder state に必要な連続メモリサイズを静的に把握する。`opus_encoder_create()` / `opus_decoder_create()` を使う場合、この state は内部で `malloc` されるため**ヒープ側の固定コスト**になる（一方、`opus_encoder_init()` / `opus_decoder_init()` を使えば static 領域や自前 arena に配置することもできる）。本ファームウェアは `create` を使用しているため、エンコーダ 1 個あたり ~11 KB がヒープから消える — スタックを広げる前に、ヒープにこれだけの余力があるかをまず確認する必要がある。
+
+#### B. `sbrk(0)` による heap break 監視 — TLS / Wi-Fi / malloc 系の余力確認
+
+`stackdiag_heap_report()` が `sbrk(0)` で現在のヒープブレークを読み、`__StackBottom`（= `__HeapLimit`）までの残り容量を報告する。**スタックを広げすぎると逆にヒープが壊れる**という逆方向の障害モードを検出するためのプローブ。
+
+このカスタムリンカスクリプト (`memmap_bigstack.ld`) では `__HeapLimit = __StackBottom` と意図的に定義しており、Core 0 スタックのうち Main RAM 側に食い込む部分はヒープと 1:1 で食い合う（ただし SCRATCH_X を併合した 4 KB 分はヒープを削らずにスタック容量へ加算できる）。`PICO_STACK_SIZE` を上げれば `__StackBottom` が下がりヒープ上限が縮小する。mbedTLS の `altcp_tls_new` だけで ~16 KB のレコードバッファを `malloc` するため、ここが詰まると Wi-Fi が無言で死ぬ。実際に `0x6000` (24 KB) にした時、このプローブがブレークと上限の差が 8 KB 未満であることを示し、OOM の原因を特定できた。
+
+なお `PICO_MALLOC_PANIC`（SDK デフォルト ON）は `malloc` が NULL を返した時に panic するが、`sbrk(0)` は読み取りだけなので **プローブ自体が OOM クラッシュを起こさない**点が重要。
+
+#### C. canary-paint high-water scan — VLA / call stack 実行時ピークの実測
+
+ファームウェアに組み込んだ canary-paint 方式のハイウォーターマーク計測（`main.c`）:
 
 1. **Paint** — ブート直後、スタックが浅いうちに `stackdiag_paint()` がスタック領域全体（+ `__StackBottom` 以下 16 KB のヒープギャップ）をカナリアワード (`0xC5C5C5C5`) で塗りつぶす。現在の SP 直下 256 B はガードとして残す。
 
 2. **Scan** — メインループ内で 2 秒ごとに `stackdiag_hiwater()` が floor から上方スキャンし、最初の非カナリアワードを検出。`__StackTop` からの距離がそれまでのピーク使用量 — `opus_encode` と `opus_decode` 両方のピークを通算で捕捉する。
 
-3. **オーバーフロー検出** — ハイウォーターマークがスタック領域サイズを超えた場合、溢れ量（"spill"）と最深部 8 ワードの hex dump を出力。Flash リターンアドレス (`0x10xxxxxx`) か RAM ポインタ (`0x20xxxxxx`) かサンプル値かで、破壊元がコールチェーンか DMA の暴走かを判別できる。
+3. **Overflow 検出** — ハイウォーターマークがスタック領域サイズを超えた場合、溢れ量（"spill"）と最深部 8 ワードの hex dump を出力。Flash リターンアドレス (`0x10xxxxxx`) か RAM ポインタ (`0x20xxxxxx`) かサンプル値かで、破壊元がコールチェーンか DMA の暴走かを判別できる。
 
-4. **Heap プローブ** — `stackdiag_heap_report()` が `sbrk(0)` で現在のヒープブレークを読み、`__StackBottom` までの残り容量を報告。逆方向の障害モード検出用 — `PICO_STACK_SIZE` を上げすぎるとヒープが 1:1 で縮み、mbedTLS の `altcp_tls_new` だけで ~16 KB のレコードバッファが必要なため、`0x6000` (24 KB) にしたら Wi-Fi が壊れた。
+このプローブが `opus_encode` のピーク **18,912 B** を実測した。
 
-5. **静的サイズプローブ** — `opus_encoder_get_size(1)` / `opus_decoder_get_size(1)` を init 時に出力し、ヒープ確保される状態サイズ（VLA のスタックコストとは別）を把握。
+#### 結論: 3 つのプローブが導いた 20 KB
 
-(A) 静的サイズプローブ、(B) ヒープブレーク監視、(C) canary-paint ハイウォータースキャンの 3 点セットにより、`opus_encode` の実測ピーク 18,912 B を収めつつ TLS 用ヒープも確保できる最小値として 20 KB に収束させた。
+| プローブ | 計測対象 | 得られた値 |
+|---|---|---|
+| A. `opus_*_get_size` | ヒープ固定コスト | encoder ~11 KB, decoder ~8 KB |
+| B. `sbrk(0)` | ヒープ残余力 | net-ready 時点でブレーク〜上限 ≒ 8 KB 余裕 |
+| C. canary-paint | スタック実行時ピーク | `opus_encode` 18,912 B / `opus_decode` 4,864 B |
+
+- C により、スタックは最低 18,912 B + α が必要
+- B により、`__StackBottom` をこれ以上下げるとヒープが TLS を賄えない
+- A により、ヒープ側の固定コストは既に織り込み済み
+
+→ SCRATCH_X を併合して **ヒープを削らずに 20 KB を確保**する現レイアウトが、3 つの制約を同時に満たす唯一の解として収束した。
+
+### 安定化までの道のり — 何が壊れたか
+
+MMU もスタックガードページもない MCU では、スタックオーバーフローは segfault しない — 隣接メモリを無言で破壊する。症状は「スタックオーバーフロー」ではなく、「音が出ない」「Wi-Fi が繋がらない」「デバイスがハングした」として現れる。最終的な 20 KB レイアウトに至るまでの各ステップは、原因と症状が遠く離れた暗闘だった。
+
+**Phase 1 — SCRATCH_Y 4 KB (SDK デフォルト)**
+
+初期ファームウェアは Core 0 上で SDK デフォルトの SCRATCH_Y 4 KB スタックのまま `opus_decode` を実行。SILK の VLA が ~3 KB、当時スタック上にあった `pcm[480]` (960 B)、コールチェーンのオーバーヘッドで合計が 4 KB を超え、無言でオーバーフロー。`handle_core0_notify` ディスパッチャのリターンアドレスが破壊され、関数から戻れなくなり IC FIFO が永久にウェッジ。Core 1 の `forward_pump` は毎回 `ic_send_avail == 0` に当たり音声の転送を停止。唯一の目に見える症状: **音声が無音のまま** — エラーなし、クラッシュなし、ログなし。
+
+原因特定には canary-paint 計測の追加が必要で、スタックが 4,096/4,096 B に張り付いていることが判明 — 明らかにオーバーフローしているが、どこまで溢れているかは見えなかった。
+
+**Phase 2 — Main RAM 16 KB (`PICO_STACK_SIZE=0x4000`)**
+
+カスタムリンカスクリプト `memmap_bigstack.ld` で Core 0 のスタックを Main RAM top に移設し 16 KB を確保。`pcm[]` も `static` に移動してスタックから 960 B を除去。`opus_decode` は安定 — canary はピーク ~4,864 B を示し、16 KB に十分収まった。
+
+その後 push-to-talk マイクキャプチャを追加し、`opus_encode` が Core 0 に乗った。canary は即座に 16,384/16,384 に張り付き — エンコードのピークが領域を超えた。しかし canary は領域内しか計測できないため、真の深度は不明だった。
+
+**Phase 3 — Main RAM 24 KB (`PICO_STACK_SIZE=0x6000`): Wi-Fi が死んだ**
+
+スタックを 24 KB に拡大すればオーバーフローは解決するはず。実際に解決した — が、`__StackBottom` が 8 KB 下がったことでヒープが同量縮小。mbedTLS の `altcp_tls_new` は `malloc` で ~16 KB のレコードバッファを確保するが、ヒープ上限が下がったため TLS ハンドシェイクが OOM し、Wi-Fi が無言で接続不能に。
+
+`stackdiag_heap_report` プローブにより、net-ready 時点でヒープブレークが `__HeapLimit` まで 8 KB 以内に達していることが確認され — 渡す余地がないことが判明した。
+
+**Phase 4 — Main RAM 16 KB + SCRATCH_X 併合 = 20 KB (`PICO_STACK_SIZE=0x5000`)**
+
+着眼点: Main RAM top (0x20080000) と SCRATCH_X (0x20080000–0x20081000) は物理的に隣接している。Core 1 のスタックを SCRATCH_X → SCRATCH_Y に移し、SCRATCH_X を Core 0 スタックの上位 4 KB として併合すれば、`__StackBottom` を一切下げずに 20 KB (0x207c000–0x20081000) が得られる — **ヒープコストゼロ**。
+
+拡張プローブウィンドウ (`__StackBottom` 以下 16 KB) 付きの canary スキャンで真のピークが判明: `opus_encode` で **18,912 B**。20 KB なら ~1.5 KB の余裕。ヒープレポートもブレークが上限を十分下回っていることを確認。Wi-Fi と TLS は安定を維持した。
+
+**その他、道中で遭遇したメモリサイジングの罠:**
+
+| 何が | 症状 | 根本原因 | 修正 |
+|---|---|---|---|
+| IC ring 64 KB × 2 | cJSON が 70 KB lab list で OOM | 128 KB BSS でヒープ枯渇 | 32 KB × 2 に縮小 |
+| `g_https_resp` 128 KB | `altcp_tls_new` OOM | +188 KB BSS でヒープ上限超過 | BSS 予算内に収めるよう調整 |
+| `pcm[480]` on stack | 無音ハング | 960 B + VLA で SCRATCH_Y 超過 | `static` に移動 |
+| `opus_encoder_create` | ヒープ圧迫 | エンコーダ 1 個あたり ~11 KB ヒープ | 許容; `sbrk(0)` プローブで検証 |
+
+共通パターン: 520 KB の MCU では **スタック・ヒープ・BSS はゼロサムゲーム**。ひとつのオーバーフローを直すと別が溢れる — 3 つを同時に計測しない限り、暗闇での手探りになる。canary-paint + ヒープブレーク + BSS サイズの 3 点同時プローブは「あると便利」ではなく、制約空間を見通す唯一の手段だった。
 
 ---
 
