@@ -1,57 +1,124 @@
-# Ito-Denwa — String Phone Device
+# Pico 2 W Realtime Opus Audio Streaming PoC
 
-A WiFi-enabled communication device shaped like a traditional Japanese string telephone (糸電話). All electronics are housed inside a paper cup form factor, providing children with a safe, screen-free way to talk with friends and family.
+> Running I2S MIC + I2S DAC + LCD + CYW43 Wi-Fi simultaneously on RP2350 / Pico 2 W,
+> streaming Opus-compressed audio to and from the cloud as a low-bandwidth realtime voice endpoint PoC.
 
-## Background
+Even on an educational, low-cost MCU, combining PIO I2S, DMA, dual-core separation, and Opus compression makes it possible to build a cloud-connected realtime audio endpoint — this firmware proves it.
 
-Growing concern over children's smartphone dependency is driving demand for screen-free alternatives worldwide. In the US, a Seattle startup called **Tin Can Antechnologies** launched a $100 WiFi-enabled "landline" phone for kids in April 2025. With no large-scale marketing — only word-of-mouth — the device sold hundreds of thousands of units in its first year, fueled by parents' desire to delay smartphone adoption and a wave of nostalgia among Gen X and Millennial parents. Schools have emerged as one of the fastest-growing sales channels, with thousands of administrators exploring bulk deployments to curb early social media dependency.
+---
 
-Ito-Denwa takes this concept further by adopting the form factor of a Japanese string telephone (糸電話) — a paper cup that children speak into and hold to their ear, just like the real thing. Where Tin Can emulates a retro landline, Ito-Denwa leans into the tactile, analog warmth of a toy that every child recognizes.
+## What this PoC proves
 
-## Concept
+| Demonstrated | Detail |
+|---|---|
+| **I2S microphone input** | PIO-generated I2S protocol for realtime audio capture on-MCU |
+| **I2S DAC/speaker output** | PIO + DMA ENDLESS ring for low-latency playback |
+| **LCD status UI** | ST7789 1.3" SPI LCD for status display and controls |
+| **CYW43 Wi-Fi always-on** | Maintaining TLS connection while running audio processing in parallel |
+| **HTTPS cloud POST / polling** | Audio send and receive over HTTPS |
+| **Opus compressed payloads** | 16–24 kHz mono Opus instead of raw PCM for drastic bandwidth reduction |
+| **Dual-core full separation** | Audio/UI and Network separated without mutex, connected via lock-free SPSC ring |
+| **BLE provisioning** | Zero-touch Wi-Fi setup from an iOS app |
 
-Key design principles:
+**In short:** A single RP2350-class ($7) MCU runs Opus / TLS / Wi-Fi / I2S Audio concurrently — a cloud voice endpoint without a smartphone or PC.
 
-- **Screen-free**: No touchscreen, no social media, no internet browsing
-- **Simple operation**: Hold to mouth to talk, hold to ear to listen
-- **Parental control**: Contact management and usage monitoring via a companion smartphone app
-- **Safety first**: Only communicates with registered contacts; no location tracking
+---
 
-## Architecture
+## Why Pico 2 W makes this hard
 
-The firmware runs on an **RP2350 (Raspberry Pi Pico 2 W)** using a dual-core cooperative architecture:
+- **520 KB RAM** — TLS buffers, Opus decoder, audio ring, and Wi-Fi stack all coexist
+- **Concurrent Wi-Fi and Audio** — cyw43_arch_poll and I2S DMA must keep running without stalling
+- **I2S via PIO** — RP2350 has no I2S peripheral; PIO programs generate the protocol
+- **Opus decoding** — SILK fixed-point decoder's VLA consumes ~3 KB of stack, overflowing the default 4 KB
+- **Back-pressure control** — Flow control spanning cloud → TCP → ring buffer → DMA, built from scratch
 
-| Core | Responsibility |
-|------|---------------|
-| Core 0 | Audio playback (I2S/PIO/DMA), LCD rendering (ST7789), button input, PCM ring drain |
-| Core 1 | WiFi networking, HTTPS/TLS communication, timeline polling, TTS streaming, Opus decoding |
 
-Cores communicate via a lock-free SPSC ring buffer (`ic_ring`) with hardware multicore FIFO notifications. Each direction has its own 64 KB ring; the FIFO carries a 32-bit descriptor per message (type + offset).
+## System Topology
 
-### Boot Sequence
+<div style="text-align:center; width:80%; box-sizing:border-box;">
+    <img src="images/radio_mix_talk_architecture.svg" style="max-width:70%; height:auto;" />
+</div>
 
-1. Core 0 initializes UART, LCD, and buttons.
-2. **BLE provisioning check** — if Button-Y is held at boot or no credentials exist in flash, the device enters BLE provisioning mode (single-core, no WiFi). A companion app writes SSID, password, device ID, and codec preference via GATT characteristics. On commit the credentials are persisted to the last flash sector (CRC-protected) and the device reboots.
-3. Normal boot: Core 1 is launched for WiFi/HTTPS. Core 0 waits for `IC_MSG_NET_READY`, then runs audio init + boot beep + streaming self-test before signaling `IC_MSG_AUDIO_READY` back.
-4. Both cores enter their main run loops — Core 1 drives HTTPS requests, TTS queue processing, and timeline polling; Core 0 drains PCM, renders the LCD, and handles button input.
+Three zones, fully separated.
 
-### System Flow
+**Cloud (minimum)** — Device registration, WSS tunnel relay, and downstream Opus audio relay only. No GPU, no CDN cache.
 
-![Architecture](docs/architecture.svg)
+**Publisher (maximum)** — Dynamically registers custom services such as radio / MIC / music. Mixing and encoding happen entirely on the Publisher side; the cloud just passes packets through.
 
-## Hardware
+**MCU + Speaker** — RP2350 + CYW43 maintains a persistent TLS connection to the cloud over Wi-Fi, decoding Opus packets on-chip via the tunnel and playing them through the I2S DAC.
 
-| Component | Detail |
-|-----------|--------|
-| CPU | RP2350 (Raspberry Pi Pico 2 W) |
-| Audio | PicoAudio — I2S via PIO, DMA-driven ring buffer |
-| Display | PicoLCD 1.3" (ST7789, 240×240, SPI) for status indication |
-| Connectivity | WiFi 2.4 GHz (CYW43 on Pico 2 W) |
-| Battery | Li-Po 1000 mAh (est. 6–8 hrs) |
-| Charging | USB-C |
-| Size | Paper cup form factor (~φ75 mm × 90 mm, ~120 g) |
 
-Additional components inside the cup: microphone, speaker, proximity sensor (mouth/ear detection).
+## Dual-Core Architecture
+
+<div style="text-align:center; width:80%; box-sizing:border-box;">
+    <img src="images/core_architecture.svg" style="max-width:70%; height:auto;" />
+</div>
+
+The two RP2350 cores are fully separated, forming the audio pipeline without any mutex.
+
+| | Core 0 (16 KB stack) | Core 1 (4 KB stack) |
+|---|---|---|
+| **Role** | Audio / UI / Opus Decode | Network / Transport / Forwarding |
+| **Stack location** | Main RAM top | SCRATCH_X |
+| **Heavy work** | opus_decode (SILK VLA ~3 KB) | TLS handshake / cyw43_arch_poll |
+| **Loop cadence** | 1 ms | 500 μs |
+| **IC direction** | Consumer (audio data) | Producer (opus pkt / PCM chunk) |
+
+Inter-core communication uses a **64 KB SPSC ring buffer + HW FIFO notify (8 slots)**. Back-pressure cascades automatically: audio ring fill 75% → IC dequeue stop → IC ring fill → ic_send_avail==0 → forward_pump skip → g_https_resp fill → recv_cb ERR_MEM → TCP window close.
+
+<div style="page-break-before: always;"></div>
+
+## Audio Pipeline
+
+Upstream and downstream have **independent DMA rings with asymmetric size, direction, and buffering strategy**.
+
+<div style="text-align:center; width:80%; box-sizing:border-box;">
+    <img src="images/dma_asymmetry.png" style="max-width:70%; height:auto;" />
+</div>
+
+Downstream uses a large DMA ring (32 KB) to absorb jitter for realtime continuous playback. Upstream keeps the ring minimal (4 KB) and buffers on the encoder + accumulator side for per-utterance batch transmission. Different purposes — no reason to make them symmetric.
+
+---
+
+## Memory Layout
+
+<div style="text-align:center; width:80%; box-sizing:border-box;">
+    <img src="images/stack_layout.svg" style="max-width:70%; height:auto;" />
+</div>
+
+Core 0's stack is relocated from the SDK default SCRATCH_Y (4 KB) to **16 KB at the top of Main RAM**. The libopus SILK WB 20 ms fixed-point decoder consumes ~3 KB via VLA, overflowing SCRATCH_Y. The heap ceiling is set by `__StackBottom`. Core 1 stays on SCRATCH_X 4 KB since it does not run Opus decoding.
+
+---
+
+## Bandwidth Reduction
+
+Comparing raw PCM vs Opus compression:
+
+| | PCM 16 kHz 16-bit mono | Opus 16 kbps |
+|---|---|---|
+| **Bitrate** | 256 kbps | 16 kbps |
+| **Reduction** | — | **93.75%** |
+| **Per minute** | 1.92 MB | 120 KB |
+
+Given CYW43's Wi-Fi throughput and RP2350's processing headroom, Opus compression is not a nice-to-have — it is **essential for stable always-on connectivity**.
+
+---
+
+## Technical Stack
+
+| Layer | What | Why |
+|---|---|---|
+| MCU | RP2350 dual-core 200 MHz | $7 class, realtime Opus decoding capable |
+| Wi-Fi | CYW43 (Pico 2 W) | Always-on TLS |
+| TLS | mbedTLS | HTTPS / WSS |
+| Codec | Opus (SILK fixed-point) | Low-bandwidth high-quality, 16–24 kHz mono |
+| Audio Out | PIO I2S → PCM5101A DAC | DMA ring 32 KB, ENDLESS mode |
+| Audio In | PIO I2S MIC | Push-to-talk voice capture |
+| IC Bus | SPSC ring + HW FIFO | lock-free, zero-copy |
+| Provisioning | BLE (BTstack) | Zero-touch setup via iOS app |
+| Display | ST7789 1.3" LCD | Status display + control UI |
+
+---
 
 ## Building
 
@@ -60,21 +127,6 @@ Additional components inside the cup: microphone, speaker, proximity sensor (mou
 - [Pico SDK](https://github.com/raspberrypi/pico-sdk) (≥ 1.3.0)
 - ARM GCC toolchain (`arm-none-eabi-gcc`)
 - CMake ≥ 3.12
-
-### Environment
-
-Set the following environment variables (or edit `.envrc`):
-
-```bash
-export PICO_SDK_PATH="$HOME/git/pico-sdk"
-export PICO_TOOLCHAIN_PATH="$HOME/git/gcc-arm-none-eabi-10.3-2021.10/bin"
-export PICO_BOARD=pico2_w
-
-# Optional — defaults to the CloudFront distribution URL baked into main.c
-export API_URL="https://your-api-server.example.com"
-```
-
-WiFi SSID, password, device ID, and codec preference are **not** build-time settings — they are provisioned at runtime via BLE and stored in on-board flash. See [Device Provisioning](#device-provisioning) below.
 
 ### Build
 
@@ -85,75 +137,9 @@ cmake ..
 make -j$(nproc)
 ```
 
-The output `.uf2` file can be flashed to the Pico 2 W via USB mass-storage mode.
-
-## Device Provisioning
-
-Credentials are provisioned over **BLE** using a companion smartphone app and persisted to the last sector of on-board flash (magic + version + CRC32 integrity check).
-
-### Entering Provisioning Mode
-
-- **First boot** (blank flash) — provisioning starts automatically.
-- **Manual** — hold **Button-Y** (GPIO 21) while powering on.
-
-### GATT Characteristics
-
-The BLE peripheral exposes a custom GATT service. The companion app writes each field, then writes `0x01` to the Commit characteristic to finalize:
-
-| Characteristic | Max Length | Description |
-|----------------|-----------|-------------|
-| SSID | 32 bytes | WiFi access point name (UTF-8) |
-| Password | 64 bytes | WiFi passphrase (UTF-8) |
-| Device ID | 64 bytes | Server-issued device UUID |
-| Opus Enable | 1 byte | `0x01` to request Opus codec for TTS |
-| Commit | 1 byte | Write `0x01` to save and reboot |
-
-On successful commit the device saves credentials to flash and reboots into normal WiFi/HTTPS operation.
-
-## Source Structure
-
-```
-examples/ito-denwa/
-├── main.c                  # Application entry, dual-core state machines
-├── cmake.rp2350/
-│   ├── CMakeLists.txt      # Build configuration for RP2350
-│   └── pico_sdk_import.cmake
-├── inc/
-│   ├── audio.h             # I2S audio playback API (PIO/DMA ring)
-│   ├── ble_provision.h     # BLE WiFi-provisioning GATT service
-│   ├── btstack_config.h    # BTstack BLE stack configuration
-│   ├── common.h            # Shared utility macros and inline functions
-│   ├── credentials.h       # Flash credential persistence (CRC-protected)
-│   ├── gui.h               # LCD GUI, status logging, button handling
-│   ├── http.h              # HTTPS client, connection state machine
-│   ├── ic_ring.h           # Inter-core SPSC ring buffer (64 KB per direction)
-│   ├── led.h               # Non-blocking LED blink state machine
-│   ├── lwipopts.h          # lwIP stack configuration
-│   ├── mbedtls_config.h    # mbedTLS configuration
-│   ├── opus_stream.h       # Opus packet decoder (24 kHz mono, 20 ms frames)
-│   ├── queue.h             # TTS message FIFO ring (SPSC, with gender)
-│   ├── st7789.h            # LCD driver API
-│   ├── tts.h               # TTS streaming pipeline (raw PCM + Opus)
-│   └── wifi.h              # WiFi initialization and DNS resolution
-└── src/
-    ├── audio.c             # PIO I2S + DMA audio engine (4096-frame ring)
-    ├── ble_provision.c     # BLE GATT server for credential provisioning
-    ├── credentials.c       # Flash read/write/erase for wifi_creds_t
-    ├── gui.c               # LCD display UI and view management
-    ├── http.c              # HTTPS communication, chunked TE decoder
-    ├── i2s.pio             # PIO program for I2S output
-    ├── ic_ring.c           # Inter-core message bus implementation
-    ├── led.c               # LED blink state machine
-    ├── opus_stream.c       # Opus decoder wrapper (libopus)
-    ├── queue.c             # Thread-safe circular TTS message queue
-    ├── st7789.c            # ST7789 SPI LCD driver
-    ├── tts.c               # TTS request building, PCM forwarding & playback
-    └── wifi.c              # WiFi connectivity setup
-```
+---
 
 ## Dependencies
 
-- [Pico SDK](https://github.com/raspberrypi/pico-sdk) — WiFi, lwIP, mbedTLS, PIO, DMA
-- [BTstack](https://github.com/bluekitchen/btstack) — BLE GATT server (bundled with Pico SDK)
-- [libopus](https://opus-codec.org/) — Opus audio decoding for compressed TTS streaming
-- [cJSON](https://github.com/DaveGamble/cJSON) — JSON parsing (from `third_party/cJSON/`)
+- [libopus](https://opus-codec.org/) — Opus audio decoding (SILK fixed-point)
+- [cJSON](https://github.com/DaveGamble/cJSON) — JSON parsing
