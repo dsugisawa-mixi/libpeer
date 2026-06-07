@@ -1,4 +1,4 @@
-# RP2350 + Sound Event Detection Module D1 — 音をトリガーにした Smart Home Automation エッジノード
+# RP2350 + Syntiant NDP120 — 音をトリガーにした Smart Home Automation エッジノード
 
 > 超低消費電力 AI 音センサ。異常音を検知した瞬間だけ起動・送信する、クラウド接続型セキュリティ端末の構想。USB-C 給電でもバッテリー駆動でも動く。
 
@@ -17,36 +17,30 @@ RP2350 (Pico 2 W) は $7 クラスの MCU でありながら、PIO I2S・DMA・d
 
 MCU の低消費電力は魅力だが音の分類ができない。SBC なら分類できるが電力を食う。**低消費電力とエッジ音分類は両立しない** — これがジレンマ。
 
-**Seeed Studio Sound Event Detection Module D1** は、このジレンマを解消する。内蔵マイク + オンチップ AI で音分類をエッジ完結させ、結果を UART で出力する。消費電力は mW オーダー。MCU に 1 本のシリアル線で追加するだけで、**MCU レベルの消費電力のまま、エッジ音分類が手に入る**。
+**Syntiant NDP120 Neural Decision Processor** は、このジレンマを解消する。専用ニューラルプロセッサ上でカスタム DNN を常時稼働させ、音分類をエッジ完結させる。消費電力は µW〜低 mW オーダー。RP2350 から SPI で直接制御でき、**MCU レベルの消費電力のまま、エッジ音分類が手に入る**。
 
 名前を付けるなら **Audio Sentinel** — 超低消費電力・小型クラウド音イベントセキュリティ端末。
 
 ---
 
-## なぜ D1 との相性が良いのか
+## なぜ NDP120 との相性が良いのか
 
-RP2350 の音声パイプラインが、そのまま D1 のバックエンドになる。
+RP2350 の音声パイプラインが、そのまま NDP120 のバックエンドになる。
 
-| RP2350 側の構成要素 | D1 追加後の役割 |
+| RP2350 側の構成要素 | NDP120 追加後の役割 |
 |---|---|
-| INMP441 → I2S RX → Opus encode | 検知後の音声キャプチャ・圧縮パイプライン |
+| PIO SPI マスター | NDP120 を直接制御、match 結果取得、PCM 抽出 |
 | Opus 16 kbps (PCM 比 93.75% 削減) | 検知時だけ送れば帯域・電力がさらに激減 |
 | TLS 常時接続 (CYW43 Wi-Fi) | 検知イベント + 音声の即時クラウド送信 |
 | Cloud relay (GPU/CDN 不要の最小構成) | 通知・証跡保存のバックエンド |
 | BLE プロビジョニング | Wi-Fi 設定はスマホから |
 | LCD + ボタン UI | 検知状態の表示・感度調整 |
 
-**追加ハードウェアはモジュール 1 個とシリアル線 2 本だけ。**
-
 ---
 
-## Sound Event Detection Module D1 とは
+## Syntiant NDP120 とは
 
-Seeed Studio が提供するオンチップ AI 音イベント検知モジュール。内蔵マイクと推論エンジンで環境音をリアルタイム分類し、検知結果を UART シリアルで出力する。
-
-<div style="text-align:center; width:80%; box-sizing:border-box;">
-    <img src="images/sound-event-detection.png" style="max-width:70%; height:auto;" />
-</div>
+Syntiant の Neural Decision Processor。専用 AI シリコン (Syntiant Core 2) 上で CNN / RNN / FC ネットワークをネイティブに実行し、音声・センサデータをリアルタイム分類する。汎用 MCU/SBC で推論を走らせるのとは設計思想が根本的に異なる — **推論そのものがシリコンレベルで最適化されている**。
 
 ### 検知可能なイベント例
 
@@ -58,11 +52,14 @@ Seeed Studio が提供するオンチップ AI 音イベント検知モジュー
 | **生活音** | いびき、咳、電子レンジ終了音 |
 | **ペット** | 犬の吠え声、猫の鳴き声 |
 
+DNN モデルは `syntiant_ndp120_tiny_load()` で SPI 経由でチャンク単位ロードできるため、OTA でモデル更新が可能。
+
 **重要な特性:**
 
-- **エッジ推論** — クラウドに音声を送らずにモジュール単体で分類が完結する
-- **超低消費電力** — 常時リスニングしていても mW オーダー
-- **シリアル出力** — UART で検知イベント名 + 信頼度を出力するだけ。RP2350 の GPIO 2 本で接続可能
+- **専用 AI シリコン** — 汎用プロセッサではなく、ニューラル推論専用のカスタムシリコン
+- **超低消費電力** — always-on 推論で µW〜低 mW オーダー。バッテリー駆動を設計前提としている
+- **SPI インターフェース** — RP2350 の PIO SPI マスターから直接レジスタアクセス。UART + AT コマンドではなく、`get_match_summary()` / `extract_data()` / `poll()` で低レイテンシ制御
+- **内蔵デジタルマイク対応** — PDM マイク入力を NDP120 が直接処理。外付けマイクも SPI 経由で PCM 取得可能
 
 ---
 
@@ -78,43 +75,91 @@ Seeed Studio が提供するオンチップ AI 音イベント検知モジュー
     <img src="images/sed_flow.png" style="max-width:70%; height:auto;" />
 </div>
 
-**D1 が「いつ」を決め、RP2350 が「何を」送るかを決める。** 役割が完全に分離される。
+**NDP120 が「いつ」を決め、RP2350 が「何を」送るかを決める。** 役割が完全に分離される。
 
 ---
 
-## 配線図
+## RP2350 — NDP120 接続
 
-<div style="text-align:center; width:80%; box-sizing:border-box;">
-    <img src="images/rp2350-wired-sed_bb.png" style="max-width:70%; height:auto;" />
-</div>
+NDP120 は SPI スレーブとして動作し、RP2350 が SPI マスターで制御する。
 
-D1 モジュールとの接続は 5V / GND / UART TX / UART RX の 4 線のみ。
+| NDP120 ピン | RP2350 ピン | 役割 |
+|---|---|---|
+| SPI_CLK | PIO SPI CLK | SPI クロック |
+| SPI_MOSI | PIO SPI TX | コマンド・モデルデータ送信 |
+| SPI_MISO | PIO SPI RX | match 結果・PCM データ受信 |
+| SPI_CS | GPIO (CS) | チップセレクト |
+| INT | GPIO (wake input) | match 検知割り込み — dormant からの起床トリガー |
+| GND | GND | |
+| 3.3V | 3.3V | |
+
+NDP120 が音イベントを検知すると **INT ピン** で割り込みを発火する。RP2350 は dormant 状態からこの GPIO 割り込みで即座に復帰し、SPI 経由で `get_match_summary()` を呼んで検知結果を取得する。
+
+```c
+// RP2350 側の処理フロー (bare-metal)
+// 1. INT 割り込みで dormant から復帰
+// 2. SPI で match 結果を取得
+syntiant_ndp120_tiny_poll(ndp, &notifications, 1);
+syntiant_ndp120_tiny_get_match_summary(ndp, &summary);
+// 3. NDP120 内蔵マイクから PCM を SPI で抽出
+syntiant_ndp120_tiny_extract_data(ndp, pcm_buf, &len);
+// 4. PCM を mxfs で Flash に append (TLS 確立まで保持)
+// 5. Opus encode → SPSC ring → Core 1 → TLS 送信
+```
 
 ---
 
 ## なぜこの構成が合理的か
 
-### 1. 帯域削減の二段構え
+### 既存アプローチとの比較
 
-| 段階 | 手法 | 効果 |
-|---|---|---|
-| **第 1 段: D1 (時間軸の削減)** | 検知時だけ送信 | 送信時間を 24h → 数秒/回に削減 |
-| **第 2 段: Opus (空間軸の削減)** | PCM → Opus 16 kbps | ビットレート 93.75% 削減 |
+音イベント検知端末の現実的な構成は、大きく 2 パターンある。
 
-常時送信 PCM: **256 kbps × 24h = 2.7 GB/日**
-D1 + Opus (1 日 10 回 × 5 秒): **16 kbps × 50 秒 = 100 KB/日**
+| | SBC + VAD + エッジ推論 | SBC + VAD + クラウド推論 | **NDP120 + MCU (本構成)** |
+|---|---|---|---|
+| **エッジ HW** | Raspberry Pi 等 (数 W) | Raspberry Pi 等 (数 W) | **NDP120 (µW〜低 mW) + RP2350 (dormant)** |
+| **エッジ処理** | VAD + 音分類モデル | VAD のみ | **NDP120 が専用シリコンで完結** |
+| **クラウド負荷** | relay のみ | 推論サーバー常時稼働 (CPU/GPU) | **relay のみ** |
+| **送信タイミング** | 推論後、必要時のみ | VAD 発火時 (誤検知含む) | **NDP120 match 時のみ** |
+| **待機電力** | 数 W (Linux 常時稼働) | 数 W (Linux 常時稼働) | **µW〜低 mW (バッテリー駆動可)** |
+| **コスト** | SBC $35–75 + 電源 | SBC + クラウド推論サーバー | **MCU $7 + NDP120** |
+| **起動時間** | 30–60 秒 | 30–60 秒 | **~2 秒** |
 
-**帯域 27,000 分の 1。** Wi-Fi の消費電力も比例して下がる。
+SBC ベースは VAD やエッジ推論を動かすために Linux を常時稼働させる必要があり、待機電力が数 W に達する。クラウド推論に頼る場合は VAD の誤検知分もアップロードされ、推論サーバーの常時稼働コストが発生する。
 
-### 2. プライバシー・バイ・デザイン
+NDP120 + MCU は、**エッジ音分類を µW〜低 mW の専用シリコンで完結させ、MCU は dormant で待機し、クラウドは relay だけ** — 3 層すべてのコストを同時に最小化する。
 
-- D1 のエッジ AI が音の「種別」だけを判定 — 会話内容はクラウドに送られない
+### プライバシー・バイ・デザイン
+
+- NDP120 のエッジ AI が音の「種別」だけを判定 — 会話内容はクラウドに送られない
 - 音声送信は検知後の数秒だけ — 常時送信ではない
-- クラウドは relay + storage のみ — GPU 推論も音声認識もしない
+- クラウドは relay + storage のみ — 推論サーバーも音声認識も不要
 
-### 3. MCU だからできる瞬間起動 — 壊されても、もう遅い
+### MCU 上の超軽量第二フィルタ — Wi-Fi 起床前に誤検知を弾く
 
-これは SBC (Raspberry Pi / Jetson) では **絶対にできない**。
+NDP120 の match をそのままクラウド POST するのではなく、RP2350 上で超軽量なフィルタを挟む。**Wi-Fi/TLS を起こす前に落とせれば、バッテリーコストはほぼゼロ**。
+
+<div style="text-align:center; width:80%; box-sizing:border-box;">
+    <img src="images/sed_second_filter.en.png" style="max-width:70%; height:auto;" />
+</div>
+
+各フィルタの計算量と効果:
+
+| フィルタ | 計算量 | 棄却できるもの |
+|---|---|---|
+| **VAD 後の発話長** | ほぼゼロ | 短すぎる衝撃音 (< 100 ms)、長すぎる環境音 (> 3 s) |
+| **平均エネルギー** | ほぼゼロ | 低エネルギーの環境ノイズ |
+| **ゼロ交差率** | ほぼゼロ | ドア音・食器など非音声の衝撃音 |
+| **メルエネルギー分布** | 軽量 | 人声と分布が異なる咳・機械音 |
+| **Mahalanobis 距離** | 軽量 (1 回の行列演算) | 学習時の統計からの外れ値 |
+
+最も費用対効果が高いのは **VAD 後の発話長 + 平均メルエネルギー分布** の組み合わせ。学習時にターゲット音イベント 100 サンプルから平均発話長・平均メルベクトル・共分散を保存しておき、実行時は Mahalanobis 距離を 1 回計算するだけ。Whisper 等のクラウド推論と比べて何万分の一の計算量で、誤検知の大半を弾ける。
+
+**バッテリー駆動ではこのフィルタが決定的に効く。** NDP120 の誤 match 1 回ごとに Wi-Fi TX (~300 mA × 数秒) が発生する。1 日 10 回の誤検知を弾ければ、バッテリー寿命が目に見えて伸びる。
+
+### MCU だからできる瞬間起動 — 壊されても、もう遅い
+
+SBC (Raspberry Pi / Jetson) では構造的に難しい。
 
 | | RP2350 (MCU) | Raspberry Pi (SBC) |
 |---|---|---|
@@ -132,35 +177,42 @@ D1 + Opus (1 日 10 回 × 5 秒): **16 kbps × 50 秒 = 100 KB/日**
 
 **MCU の bare-metal 起動は「セキュリティ機能」である。** OS がないことは制約ではなく、防犯デバイスにとっては利点になる。ブートローダーもファイルシステムも init プロセスもない — 電源が入った瞬間にコードが走る。攻撃面もゼロ: SSH ポートもシェルも存在しない。
 
-さらに、D1 自体は常時給電・常時リスニングしているため、RP2350 を deep sleep にしておき D1 の検知で GPIO 割り込み起床させる構成も可能。この場合、**待機電力は D1 の数 mA のみ** — バッテリー駆動が視野に入る。
+**検知直後の音声を取りこぼさない — mxfs による Flash バッファリング**
 
-**バッテリー構成例: Eneloop 2 本 + スーパーキャパシタ**
+NDP120 が match を発火してから TLS 確立まで約 1.8 秒かかる。この間に NDP120 の内蔵マイクが拾う PCM こそが最も重要な音声（ガラスが割れる音、叫び声、侵入音）だが、SRAM 予算では長時間のバッファリングが難しい。
+
+[mxfs](https://github.com/xander-jp/mxfs) — bare-metal 向け append-only ログ構造ファイルシステム（≤10 KB RAM、~1 KB コード）を使い、`extract_data()` で NDP120 から SPI 経由で取得した PCM を即座に SPI Flash へ append する。TLS 確立後に Flash から読み出して Opus encode → クラウド送信。
+
+<div style="text-align:center; width:80%; box-sizing:border-box;">
+    <img src="images/sed_flash_buffer.png" style="max-width:70%; height:auto;" />
+</div>
+
+mxfs は append-only で電源断耐性があるため、バッテリー駆動中の突然の電力喪失でもデータが壊れない。fsck も不要。
+
+さらに、NDP120 の INT ピンが RP2350 の dormant モードからの起床を可能にする。NDP120 は常時給電・常時推論し、match 検知時に INT を発火 → RP2350 が GPIO 割り込みで即座に dormant から復帰。NDP120 の always-on 消費電力は µW〜低 mW オーダーなので、**バッテリー駆動が現実的になる**。
+
+**バッテリー構成例: Eneloop AA × 2 + boost + デカップリング**
 
 | 状態 | 消費電流 (3.3V 側) | 時間比率 |
 |---|---|---|
-| 待機 (D1 リスニング + RP2350 dormant + CYW43 電源断) | ~1.5–2 mA | 99.9% |
+| 待機 (NDP120 always-on 推論 + RP2350 dormant + CYW43 電源断) | ~数百 µA | 99.9% |
 | イベント発火 (RP2350 起床 + CYW43 Wi-Fi TX) | ~300 mA peak | 数秒/回 |
 
-CYW43 の Wi-Fi TX ピークは ~300 mA に達するが、発火は 1 日数回・数秒ずつ。スーパーキャパシタ (1–数 F) でピークをバッファし、バッテリーからの定常給電は ~2 mA に抑える。
+NDP120 の always-on 推論は µW〜低 mW オーダー。CYW43 の Wi-Fi TX ピークは ~300 mA に達するが、発火は 1 日数回・数秒ずつ。バッテリーからの定常給電は ~1 mA 未満に抑えられる。
 
-```
-Eneloop 2 本 (2.4V, 1900 mAh)
-    → boost converter (→ 3.3V, 効率 ~85%)
-    → スーパーキャパシタ (Wi-Fi TX ピークバッファ)
-    → D1 (常時給電 ~1 mA) + RP2350 (dormant ~0.2 mA / burst)
-```
+<div style="text-align:center; width:80%; box-sizing:border-box;">
+    <img src="images/sed_battery.en.png" style="max-width:70%; height:auto;" />
+</div>
 
-バッテリー側 ~2.5 mA → **Eneloop 2 本で約 1 ヶ月**。USB-C 給電が取れない場所 — 屋外の物置、離れ、車内 — にも設置できる。
+Pico 2 W 基板上の RT6154 buck-boost SMPS (入力 1.8–5.5V) + デカップリングが Wi-Fi TX の 300 mA を連続供給する。Eneloop 2.4V を VSYS ピンに接続するだけで動作する。
 
-### 4. 双方向 — スマホから現場に声を届ける
+### 双方向 — スマホから現場に声を届ける
 
 RP2350 は PIO I2S TX + PCM5101A DAC + スピーカーによる下り音声再生を備えている。つまり、検知 → 通知の片方向ではなく、**スマホから現場に向かって話しかける双方向インターコム** が成立する。
 
-```
-D1 検知 → Opus 上り → Cloud → スマホ通知
-                                    ↓ ユーザーが「何があった？」と発話
-                              スマホ → Cloud → Opus 下り → RP2350 → スピーカー再生
-```
+<div style="text-align:center; width:80%; box-sizing:border-box;">
+    <img src="images/sed_talkback.en.png" style="max-width:70%; height:auto;" />
+</div>
 
 スマホ側は通知を受けた時点で即座にトークバックできる。現場側は追加ハードウェア不要 — I2S DAC と DMA ring 32 KB の下り再生パイプラインが構成に含まれている。
 
@@ -173,15 +225,15 @@ D1 検知 → Opus 上り → Cloud → スマホ通知
 | ペット見守り — 犬が吠え続ける | 飼い主の声で落ち着かせる |
 | 玄関 — ドア開閉検知 | 「おかえり」と自動再生 |
 
-### 5. クラウドコストほぼゼロ
+### クラウドコストほぼゼロ
 
-クラウド側は GPU も CDN も持たない relay 中心の最小構成で設計する。D1 + RP2350 はイベント駆動で数秒の Opus パケットを送るだけなので、クラウド側の負荷はほぼゼロ。スマホからのトークバックも Opus 下りパケットを relay するだけ — 追加のサーバーリソースは不要。
+クラウド側は GPU も CDN も持たない relay 中心の最小構成で設計する。NDP120 + RP2350 はイベント駆動で数秒の Opus パケットを送るだけなので、クラウド側の負荷はほぼゼロ。スマホからのトークバックも Opus 下りパケットを relay するだけ — 追加のサーバーリソースは不要。
 
 ---
 
 ## Smart Home Automation ユースケース
 
-| カテゴリ | D1 検知 | RP2350 アクション | Cloud → ユーザー |
+| カテゴリ | NDP120 検知 | RP2350 アクション | Cloud → ユーザー |
 |---|---|---|---|
 | **玄関監視** | ガラス破壊音 | Opus で検知後 5 秒送信 | 「玄関で異常音を検知」+ 音声再生 |
 | | ドア開閉音 | イベントログ送信 | 帰宅通知 |
@@ -204,9 +256,9 @@ D1 検知 → Opus 上り → Cloud → スマホ通知
 
 ---
 
-## Dual-Core アーキテクチャへの D1 統合
+## Dual-Core アーキテクチャへの NDP120 統合
 
-RP2350 の 2 コアを完全に分離した音声パイプラインに、D1 がどう組み込まれるか。
+RP2350 の 2 コアを完全に分離した音声パイプラインに、NDP120 がどう組み込まれるか。
 
 | | Core 0 (20 KB stack) | Core 1 (4 KB stack) |
 |---|---|---|
@@ -237,32 +289,43 @@ RP2350 は Main RAM (512 KB) とは別に SCRATCH_X / SCRATCH_Y (4 KB × 2) を�
 
 カスタムリンカスクリプト `memmap_bigstack.ld` で Core 0 のスタックを Main RAM top に移設し、物理的に隣接する SCRATCH_X を併合して **20 KB** を確保 — **ヒープを一切削らずに** Opus encode のピークを収容する。Core 1 は SCRATCH_Y (4 KB) に退避。520 KB MCU ではスタック・ヒープ・BSS がゼロサムゲームであり、canary-paint + sbrk(0) + opus_get_size の 3 点同時計測でこのレイアウトに収束した。
 
-### Core 0 への D1 統合
+### Core 0 への NDP120 統合
 
 ```
-INMP441 → I2S RX DMA → Opus encode → SPSC ring → Core 1 (TLS 送信)
-D1 UART RX → イベントパース → 録音トリガー制御 (上記パイプラインの起動/停止)
+NDP120 INT → GPIO IRQ → RP2350 dormant 復帰
+    ↓
+get_match_summary() → イベント種別 + 信頼度
+extract_data() → PCM 取得
+    ↓
+軽量フィルタ (VAD → 発話長 → エネルギー/ZCR → Mahalanobis)
+    ↓ NG → dormant に戻る (Wi-Fi を起こさない)
+    ↓ OK
+mxfs append (Flash) + Wi-Fi/TLS 確立 (並行)
+    ↓
+Opus encode → SPSC ring → Core 1 (TLS 送信)
 ```
 
-Core 0 は Audio / UI を担当し、UART の受信パースは軽量（数バイトのイベントラベル）なので負荷増はほぼない。D1 からイベントを受信したら:
+NDP120 の INT が dormant から起こし、SPI で match 結果と PCM を取得する。ここで **Wi-Fi を起こす前に** 軽量フィルタで誤検知を判定し、NG なら即座に dormant に戻る。OK の場合のみ mxfs + Wi-Fi/TLS のコストを払う。
 
-1. INMP441 の I2S RX DMA を有効化（またはリングバッファの読み出しを開始）
-2. 検知後数秒分の Opus エンコードを実行
-3. イベントメタデータ（種別 + 信頼度 + タイムスタンプ）をペイロードに付与
-4. SPSC ring 経由で Core 1 へ転送
+1. INT 発火 → dormant 復帰、`poll()` + `get_match_summary()` で検知イベントを取得
+2. `extract_data()` で NDP120 内蔵マイクの PCM を SPI 経由で取得
+3. **軽量フィルタ**: VAD → 発話長チェック → 平均エネルギー/ZCR → Mahalanobis 距離。NG なら dormant に戻る
+4. OK → PCM を mxfs で Flash に append、Wi-Fi association + TLS handshake (並行)
+5. TLS 確立後、Flash から PCM を読み出して Opus encode
+6. イベントメタデータ（種別 + 信頼度 + タイムスタンプ）を付与、SPSC ring 経由で Core 1 へ転送
 
 ### Core 1 の変更なし
 
 Core 1 は Network / Transport 専任。SPSC ring からデータを取り出して TLS 送信する — この動作は常時送信でもイベント駆動でも同じ。**Core 1 のコードは常時送信でもイベント駆動でも同じ。** トークバックの下り（Cloud → Opus decode → DAC）も同一の下りパイプラインで処理する。
 
-### D1 追加によるメモリへの影響
+### NDP120 追加によるメモリへの影響
 
 | 追加要素 | コスト |
 |---|---|
-| UART RX バッファ | ~256 B (BSS) |
-| イベントパーサ | ~1 KB (Flash) |
+| syntiant_ndp120_tiny ドライバ | ~2–3 KB (Flash + BSS) |
+| SPI TX/RX バッファ | ~256 B (BSS) |
 
-520 KB の SRAM 予算に対して **~1.3 KB の追加** — ヒープ余力で十分吸収できる。Opus encoder/decoder・DMA ring・SPSC ring・TLS バッファはすべて上述の SRAM 配分内。
+520 KB の SRAM 予算に対して **~3 KB の追加** — ヒープ余力で十分吸収できる。NDP120 の DNN モデルは NDP120 自身のオンチップメモリに格納されるため、RP2350 の SRAM を消費しない。Opus encoder/decoder・DMA ring・SPSC ring・TLS バッファはすべて上述の SRAM 配分内。
 
 ---
 
@@ -270,8 +333,8 @@ Core 1 は Network / Transport 専任。SPSC ring からデータを取り出し
 
 構成要素はすべて揃っている:
 
-- **検知** — D1 のエッジ AI (mW オーダー)
-- **上り** — INMP441 → Opus encode → Cloud (93.75% 帯域削減)
+- **検知** — NDP120 専用 AI シリコン (µW〜低 mW)
+- **上り** — NDP120 内蔵マイク → SPI PCM 抽出 → Opus encode → Cloud (93.75% 帯域削減)
 - **下り** — Cloud → Opus decode → PCM5101A DAC → スピーカー (トークバック)
 - **送信** — TLS 常時接続 (CYW43)
 - **クラウド** — relay のみ (GPU/CDN 不要)
@@ -280,19 +343,21 @@ Core 1 は Network / Transport 専任。SPSC ring からデータを取り出し
 
 ---
 
-## Technical Stack (D1 追加後)
+## Technical Stack (NDP120 構成)
 
 | Layer | What | Why |
 |---|---|---|
 | MCU | RP2350 dual-core 200 MHz | $7 クラス、Opus リアルタイムエンコード可能 |
-| Sound Event Detection | Seeed Studio D1 Module | エッジ AI 音分類、UART 出力 |
-| Wi-Fi | CYW43 (Pico 2 W) | 常時 TLS 接続 |
+| Neural Decision Processor | Syntiant NDP120 | 専用 AI シリコン、always-on 音分類、µW〜低 mW |
+| NDP120 ↔ RP2350 | PIO SPI (master/slave) | レジスタ直アクセス、match 通知、PCM 抽出 |
+| Wi-Fi | CYW43 (Pico 2 W) | イベント時のみ TLS 接続 |
 | TLS | mbedTLS | HTTPS / WSS |
 | Codec (encode) | Opus (SILK fixed-point) 16 kHz mono 16 kbps | MCU → Cloud イベント検知時の音声圧縮送信 |
 | Codec (decode) | Opus (SILK fixed-point) 24 kHz mono | Cloud → MCU トークバック再生 |
-| Audio In | PIO I2S RX ← INMP441 MEMS mic | 検知トリガー後の音声キャプチャ |
+| Audio In | NDP120 内蔵 PDM マイク (SPI 経由 PCM 抽出) | 外付けマイク不要 |
 | Audio Out | PIO I2S TX → PCM5101A DAC + スピーカー | DMA ring 32 KB、スマホからのトークバック再生 |
+| Flash Buffer | mxfs on SPI Flash | 検知〜TLS 確立間の PCM 保持、電源断耐性 |
 | IC Bus | SPSC ring + HW FIFO | lock-free, zero-copy |
 | Provisioning | BLE (BTstack) | iOS app でゼロタッチ設定 |
 | Display | ST7789 1.3" LCD (optional) | 検知状態表示 |
-| Power | USB-C 5V / Eneloop 2 本 + boost + supercap | コンセント or バッテリー駆動 |
+| Power | USB-C 5V / Eneloop AA×2 + 1A 級低 Iq boost + MLCC/低ESR cap | コンセント or バッテリー駆動 (数ヶ月) |
