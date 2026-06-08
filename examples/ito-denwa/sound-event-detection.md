@@ -4,22 +4,28 @@
 
 ---
 
+<div style="text-align:center; width:80%; box-sizing:border-box;">
+    <img src="images/rp2350-wired-sed_cc.png" style="max-width:70%; height:auto;" />
+</div>
+
+
+
 ## はじめに — MCU で「音に反応する端末」を作るジレンマ
 
 RP2350 (Pico 2 W) は $7 クラスの MCU でありながら、PIO I2S・DMA・dual-core 分離・Opus 圧縮を組み合わせれば、Wi-Fi + TLS 常時接続のリアルタイム音声端末を構成できる。I2S MEMS マイク (INMP441) で音声をキャプチャし、Opus 16 kbps にエンコードしてクラウドへ送信する — PCM 直送比 93.75% の帯域削減。
 
-しかし「特定の音が鳴ったときだけ送信したい」場合、MCU 単体では手詰まりになる。
+しかし「特定の音が鳴ったときだけ送信したい」場合、NDP120 なしの MCU 単体では手詰まりになる。
 
 | 選択肢 | 問題 |
 |---|---|
 | **常時クラウド送信** | 帯域・電力が膨大。バッテリー駆動不可 |
 | **エッジで VAD / 音分類** | SBC (Raspberry Pi 等) レベルの計算資源が必要。MCU では動かない。SBC では消費電力が高すぎる |
 
-MCU の低消費電力は魅力だが音の分類ができない。SBC なら分類できるが電力を食う。**低消費電力とエッジ音分類は両立しない** — これがジレンマ。
+MCU の低消費電力は魅力だが音の分類ができない。SBC なら分類できるが電力を食う。**低消費電力とエッジ音分類は両立しない。**
 
 **Syntiant NDP120 Neural Decision Processor** は、このジレンマを解消する。専用ニューラルプロセッサ上でカスタム DNN を常時稼働させ、音分類をエッジ完結させる。消費電力は µW〜低 mW オーダー。RP2350 から SPI で直接制御でき、**MCU レベルの消費電力のまま、エッジ音分類が手に入る**。
 
-名前を付けるなら **Audio Sentinel** — 超低消費電力・小型クラウド音イベントセキュリティ端末。
+この構成を **Audio Sentinel** と呼ぶ — 超低消費電力・小型クラウド音イベントセキュリティ端末。
 
 ---
 
@@ -62,6 +68,13 @@ DNN モデルは `syntiant_ndp120_tiny_load()` で SPI 経由でチャンク単�
 - **内蔵デジタルマイク対応** — PDM マイク入力を NDP120 が直接処理。外付けマイクも SPI 経由で PCM 取得可能
 
 ---
+
+## コア分離
+
+<div style="text-align:center; width:80%; box-sizing:border-box;">
+    <img src="images/core_architecture.png" style="max-width:70%; height:auto;" />
+</div>
+
 
 ## システム構成
 
@@ -157,7 +170,7 @@ NDP120 の match をそのままクラウド POST するのではなく、RP2350
 
 **バッテリー駆動ではこのフィルタが決定的に効く。** NDP120 の誤 match 1 回ごとに Wi-Fi TX (~300 mA × 数秒) が発生する。1 日 10 回の誤検知を弾ければ、バッテリー寿命が目に見えて伸びる。
 
-### MCU だからできる瞬間起動 — 壊されても、もう遅い
+### MCU だからできる瞬間起動 — 検知から送信まで 2 秒以内
 
 SBC (Raspberry Pi / Jetson) では構造的に難しい。
 
@@ -291,19 +304,9 @@ RP2350 は Main RAM (512 KB) とは別に SCRATCH_X / SCRATCH_Y (4 KB × 2) を�
 
 ### Core 0 への NDP120 統合
 
-```
-NDP120 INT → GPIO IRQ → RP2350 dormant 復帰
-    ↓
-get_match_summary() → イベント種別 + 信頼度
-extract_data() → PCM 取得
-    ↓
-軽量フィルタ (VAD → 発話長 → エネルギー/ZCR → Mahalanobis)
-    ↓ NG → dormant に戻る (Wi-Fi を起こさない)
-    ↓ OK
-mxfs append (Flash) + Wi-Fi/TLS 確立 (並行)
-    ↓
-Opus encode → SPSC ring → Core 1 (TLS 送信)
-```
+<div style="text-align:center; width:80%; box-sizing:border-box;">
+    <img src="images/sed_core0_flow.en.png" style="max-width:70%; height:auto;" />
+</div>
 
 NDP120 の INT が dormant から起こし、SPI で match 結果と PCM を取得する。ここで **Wi-Fi を起こす前に** 軽量フィルタで誤検知を判定し、NG なら即座に dormant に戻る。OK の場合のみ mxfs + Wi-Fi/TLS のコストを払う。
 
