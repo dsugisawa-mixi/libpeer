@@ -213,6 +213,14 @@ int peer_connection_send_video(PeerConnection* pc, const uint8_t* buf, size_t le
   return rtp_encoder_encode(&pc->vrtp_encoder, buf, len);
 }
 
+int peer_connection_send_video_ts(PeerConnection* pc, const uint8_t* buf, size_t len, uint32_t rtp_timestamp) {
+  if (pc->state != PEER_CONNECTION_COMPLETED) {
+    return -1;
+  }
+  rtp_encoder_set_timestamp(&pc->vrtp_encoder, rtp_timestamp);
+  return rtp_encoder_encode(&pc->vrtp_encoder, buf, len);
+}
+
 int peer_connection_datachannel_send(PeerConnection* pc, char* message, size_t len) {
   return peer_connection_datachannel_send_sid(pc, message, len, 0);
 }
@@ -464,8 +472,15 @@ static const char* peer_connection_create_sdp(PeerConnection* pc, SdpType sdp_ty
   sdp_append(pc->sdp, "a=fingerprint:sha-256 %s", pc->dtls_srtp.local_fingerprint);
   sdp_append(pc->sdp, peer_connection_dtls_role_setup_value(role));
 
-  if (pc->config.video_codec == CODEC_H264) {
-    sdp_append_h264(pc->sdp);
+  switch (pc->config.video_codec) {
+    case CODEC_H264:
+      sdp_append_h264(pc->sdp);
+      break;
+    case CODEC_AV1:
+      sdp_append_av1(pc->sdp);
+      break;
+    default:
+      break;
   }
 
   switch (pc->config.audio_codec) {

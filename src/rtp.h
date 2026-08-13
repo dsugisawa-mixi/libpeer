@@ -20,6 +20,7 @@ typedef enum RtpPayloadType {
   PT_PCMU = 0,
   PT_PCMA = 8,
   PT_G722 = 9,
+  PT_AV1 = 45,  // same dynamic PT as Chrome/libwebrtc uses for AV1
   PT_H264 = 96,
   PT_OPUS = 111
 
@@ -28,6 +29,7 @@ typedef enum RtpPayloadType {
 typedef enum RtpSsrc {
 
   SSRC_H264 = 1,
+  SSRC_AV1 = 2,
   SSRC_PCMA = 4,
   SSRC_PCMU = 5,
   SSRC_OPUS = 6,
@@ -98,6 +100,8 @@ int rtp_packet_validate(uint8_t* packet, size_t size);
 void rtp_encoder_init(RtpEncoder* rtp_encoder, MediaCodec codec, RtpOnPacket on_packet, void* user_data);
 
 int rtp_encoder_encode(RtpEncoder* rtp_encoder, const uint8_t* data, size_t size);
+
+void rtp_encoder_set_timestamp(RtpEncoder* rtp_encoder, uint32_t timestamp);
 
 void rtp_decoder_init(RtpDecoder* rtp_decoder, MediaCodec codec, RtpOnPacket on_packet, void* user_data);
 

@@ -332,7 +332,9 @@ static int peer_signaling_http_post(const char* hostname, const char* path, int 
   } else {
     trans_if.recv = (TransportRecv_t)tcp_transport_recv;
     trans_if.send = (TransportSend_t)tcp_transport_send;
-    trans_if.pNetworkContext = &tcp_net_ctx;
+    // tcp_transport_{recv,send} take a PlainNetworkContext_t; coreHTTP only
+    // ever passes this pointer back to them untouched.
+    trans_if.pNetworkContext = (NetworkContext_t*)&tcp_net_ctx;
 
     ret = tcp_transport_connect(&tcp_net_ctx, hostname, port);
   }

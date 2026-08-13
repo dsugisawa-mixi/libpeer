@@ -54,6 +54,7 @@ typedef enum MediaCodec {
   CODEC_H264,
   CODEC_VP8,    // not implemented yet
   CODEC_MJPEG,  // not implemented yet
+  CODEC_AV1,    // send only (RTP payload format for AV1 v1.0.0)
 
   /* Audio */
   CODEC_OPUS,  // not implemented yet
@@ -116,6 +117,20 @@ int peer_connection_datachannel_send_sid(PeerConnection* pc, char* message, size
 int peer_connection_send_audio(PeerConnection* pc, const uint8_t* packet, size_t bytes);
 
 int peer_connection_send_video(PeerConnection* pc, const uint8_t* packet, size_t bytes);
+
+/**
+ * @brief send video with an explicit RTP timestamp (90kHz) instead of the
+ *        internally incremented one.
+ * @param[in] peer connection
+ * @param[in] encoded frame (for CODEC_AV1: one temporal unit of OBUs)
+ * @param[in] length of the encoded frame
+ * @param[in] RTP timestamp to stamp on every packet of this frame
+ *
+ * Lets the sender put a meaningful clock into the RTP timestamp (e.g. a
+ * PTP/NTP synchronised wall clock shared by several devices) so that the
+ * receiver can line up frames coming from different senders.
+ */
+int peer_connection_send_video_ts(PeerConnection* pc, const uint8_t* packet, size_t bytes, uint32_t rtp_timestamp);
 
 void peer_connection_set_remote_description(PeerConnection* pc, const char* sdp, SdpType sdp_type);
 

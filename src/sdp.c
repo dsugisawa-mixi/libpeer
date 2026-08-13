@@ -39,6 +39,22 @@ void sdp_append_h264(char* sdp) {
   sdp_append(sdp, "a=rtcp-mux");
 }
 
+/* AV1: Main profile, level 4.0 (level-idx=8 covers up to 1920x1080@30), Main tier.
+ * PT 45 and the fmtp form match what Chrome/libwebrtc offers. */
+void sdp_append_av1(char* sdp) {
+  sdp_append(sdp, "m=video 9 UDP/TLS/RTP/SAVPF 45");
+  sdp_append(sdp, "c=IN IP4 0.0.0.0");
+  sdp_append(sdp, "a=rtcp-fb:45 nack");
+  sdp_append(sdp, "a=rtcp-fb:45 nack pli");
+  sdp_append(sdp, "a=rtcp-fb:45 ccm fir");
+  sdp_append(sdp, "a=fmtp:45 profile=0;level-idx=8;tier=0");
+  sdp_append(sdp, "a=rtpmap:45 AV1/90000");
+  sdp_append(sdp, "a=ssrc:2 cname:webrtc-av1");
+  sdp_append(sdp, "a=sendrecv");
+  sdp_append(sdp, "a=mid:video");
+  sdp_append(sdp, "a=rtcp-mux");
+}
+
 void sdp_append_pcma(char* sdp) {
   sdp_append(sdp, "m=audio 9 UDP/TLS/RTP/SAVP 8");
   sdp_append(sdp, "c=IN IP4 0.0.0.0");
