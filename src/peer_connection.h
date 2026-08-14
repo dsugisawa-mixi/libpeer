@@ -79,6 +79,23 @@ typedef struct PeerConfiguration {
   void (*on_request_keyframe)(void* userdata);
   void* user_data;
 
+  /**
+   * Offer a=setup:active and take the DTLS client role.
+   *
+   * The default (0) offers a=setup:passive, i.e. the DTLS server. That
+   * expects the other end to answer active, which is what a browser does.
+   *
+   * Some SFUs always make themselves the DTLS server, though: Cloudflare
+   * Calls answers a=setup:passive unconditionally. Both ends are then
+   * passive and the handshake never starts, so set this to 1 to swap the
+   * roles.
+   *
+   * The role has to be chosen when the offer is built: changing it later
+   * regenerates the certificate and fingerprint, which would no longer
+   * match the offer already sent.
+   */
+  int dtls_offer_active;
+
 } PeerConfiguration;
 
 typedef struct PeerConnection PeerConnection;
