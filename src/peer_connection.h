@@ -82,6 +82,22 @@ typedef struct PeerConfiguration {
   void (*on_request_keyframe)(void* userdata);
   void* user_data;
 
+  /**
+   * offer で a=setup:active を出し、DTLS クライアントとして振る舞う。
+   *
+   * 既定 (0) は a=setup:passive = DTLS サーバ。相手が active を返す
+   * 前提の動作で、ブラウザ相手ならこれで繋がる。
+   *
+   * ただし SFU には自分が必ず DTLS サーバになるものがある
+   * (Cloudflare Calls は answer で常に a=setup:passive を返す)。
+   * その場合は双方 passive になり handshake が始まらないので、
+   * こちらを 1 にして役割を入れ替える。
+   *
+   * offer 送出後に role を変えると証明書と fingerprint が作り直しに
+   * なってしまうため、接続先に合わせて offer 時点で決める必要がある。
+   */
+  int dtls_offer_active;
+
 } PeerConfiguration;
 
 typedef struct PeerConnection PeerConnection;

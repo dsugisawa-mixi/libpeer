@@ -395,6 +395,8 @@ void peer_connection_set_remote_description(PeerConnection* pc, const char* sdp,
 
     if (strstr(buf, "a=setup:passive")) {
       role = DTLS_SRTP_ROLE_CLIENT;
+    } else if (strstr(buf, "a=setup:active")) {
+      role = DTLS_SRTP_ROLE_SERVER;
     }
 
     if (strstr(buf, "a=fingerprint")) {
@@ -425,6 +427,17 @@ void peer_connection_set_remote_description(PeerConnection* pc, const char* sdp,
     return;
   }
 
+  /* remote の a=setup: から決まる role と、offer 時に決めた role の食い違いを
+   * 検出する。ここで role を差し替えると証明書と fingerprint が作り直しに
+   * なり、既に送った offer と矛盾するので直せない。黙って進めると DTLS が
+   * 無言でタイムアウトするだけなので、原因を残す。 */
+  if (type == SDP_TYPE_ANSWER && role != pc->dtls_srtp.role) {
+    LOGE("DTLS role conflict: both sides want to be %s. "
+         "set PeerConfiguration.dtls_offer_active=%d and re-offer",
+         role == DTLS_SRTP_ROLE_SERVER ? "server (passive)" : "client (active)",
+         role == DTLS_SRTP_ROLE_SERVER ? 0 : 1);
+  }
+
   agent_set_remote_description(&pc->agent, (char*)sdp);
   if (type == SDP_TYPE_ANSWER) {
     agent_update_candidate_pairs(&pc->agent);
@@ -442,7 +455,9 @@ static const char* peer_connection_create_sdp(PeerConnection* pc, SdpType sdp_ty
 
   switch (sdp_type) {
     case SDP_TYPE_OFFER:
-      role = DTLS_SRTP_ROLE_SERVER;
+      /* 既定は passive (DTLS サーバ)。常に passive を返す SFU 相手では
+       * dtls_offer_active で active (クライアント) 側に回る */
+      role = pc->config.dtls_offer_active ? DTLS_SRTP_ROLE_CLIENT : DTLS_SRTP_ROLE_SERVER;
       agent_clear_candidates(&pc->agent);
       pc->agent.mode = AGENT_MODE_CONTROLLING;
       break;
