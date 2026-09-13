@@ -35,8 +35,8 @@ struct PeerConnection {
   void (*on_connected)(void* userdata);
   void (*on_receiver_packet_loss)(float fraction_loss, uint32_t total_loss, void* user_data);
 
-  uint8_t temp_buf[CONFIG_MTU];
-  uint8_t agent_buf[CONFIG_MTU];
+  uint8_t temp_buf[CONFIG_RECV_BUFFER_SIZE];
+  uint8_t agent_buf[CONFIG_RECV_BUFFER_SIZE];
   int agent_ret;
 
   RtpEncoder artp_encoder;
@@ -345,13 +345,16 @@ int peer_connection_loop(PeerConnection* pc) {
         } else if (rtp_packet_validate(pc->agent_buf, pc->agent_ret)) {
           LOGD("Got RTP packet");
 
-          dtls_srtp_decrypt_rtp_packet(&pc->dtls_srtp, pc->agent_buf, &pc->agent_ret);
-
-          ssrc = rtp_get_ssrc(pc->agent_buf);
-          if (ssrc == pc->remote_assrc) {
-            rtp_decoder_decode(&pc->artp_decoder, pc->agent_buf, pc->agent_ret);
-          } else if (ssrc == pc->remote_vssrc) {
-            rtp_decoder_decode(&pc->vrtp_decoder, pc->agent_buf, pc->agent_ret);
+          // A packet that failed to decrypt is still ciphertext in the
+          // buffer. Handing it on means the depacketizer reads ciphertext
+          // as a payload format, so drop it here instead.
+          if (dtls_srtp_decrypt_rtp_packet(&pc->dtls_srtp, pc->agent_buf, &pc->agent_ret) == 0) {
+            ssrc = rtp_get_ssrc(pc->agent_buf);
+            if (ssrc == pc->remote_assrc) {
+              rtp_decoder_decode(&pc->artp_decoder, pc->agent_buf, pc->agent_ret);
+            } else if (ssrc == pc->remote_vssrc) {
+              rtp_decoder_decode(&pc->vrtp_decoder, pc->agent_buf, pc->agent_ret);
+            }
           }
 
         } else {

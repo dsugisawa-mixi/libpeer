@@ -745,8 +745,18 @@ int dtls_srtp_probe(uint8_t* buf) {
   return (buf[0] == 0x17);
 }
 
-void dtls_srtp_decrypt_rtp_packet(DtlsSrtp* dtls_srtp, uint8_t* packet, int* bytes) {
-  srtp_unprotect(dtls_srtp->srtp_in, packet, bytes);
+/* When srtp_unprotect fails the packet is left as ciphertext. Feeding that
+ * down the same path as a successful one makes the depacketizer parse
+ * undecrypted bytes, which surfaces as an unexplained parse error rather
+ * than as a decryption problem. Stop here and say why. */
+int dtls_srtp_decrypt_rtp_packet(DtlsSrtp* dtls_srtp, uint8_t* packet, int* bytes) {
+  srtp_err_status_t status = srtp_unprotect(dtls_srtp->srtp_in, packet, bytes);
+
+  if (status != srtp_err_status_ok) {
+    LOGW("srtp_unprotect failed: status=%d bytes=%d", (int)status, *bytes);
+    return -1;
+  }
+  return 0;
 }
 
 void dtls_srtp_decrypt_rtcp_packet(DtlsSrtp* dtls_srtp, uint8_t* packet, int* bytes) {

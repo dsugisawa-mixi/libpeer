@@ -78,6 +78,14 @@
 #define CONFIG_MAX_NALU_SIZE (100 * 1024)  // 100KB
 #endif
 
+// CONFIG_MTU bounds what we send. What we receive is bounded by the peer, and
+// an SFU happily sends larger datagrams. recvfrom truncates silently, so a
+// receive buffer sized to CONFIG_MTU loses the tail of every full-size packet
+// -- including the SRTP auth tag, which turns into srtp_err_status_auth_fail.
+#ifndef CONFIG_RECV_BUFFER_SIZE
+#define CONFIG_RECV_BUFFER_SIZE 2048
+#endif
+
 #define CONFIG_IPV6 0
 // empty will use first active interface
 #define CONFIG_IFACE_PREFIX ""
