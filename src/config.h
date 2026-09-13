@@ -61,6 +61,12 @@
 #define CONFIG_MAX_NALU_SIZE (10 * 1024)  // 10KB
 #endif
 
+// One reassembled AV1 temporal unit. A keyframe is far bigger than a NALU,
+// so this gets its own budget; shrink it on targets where the BSS matters.
+#ifndef CONFIG_MAX_AV1_TU_SIZE
+#define CONFIG_MAX_AV1_TU_SIZE (256 * 1024)  // 256KB
+#endif
+
 // How often an established connection sends an RFC 7675 consent check. Has to
 // stay well under CONFIG_KEEPALIVE_TIMEOUT so a lost check still leaves room
 // for the next one to be answered. 0 disables it.
@@ -74,6 +80,15 @@
 // -- including the SRTP auth tag, which turns into srtp_err_status_auth_fail.
 #ifndef CONFIG_RECV_BUFFER_SIZE
 #define CONFIG_RECV_BUFFER_SIZE 2048
+#endif
+
+// AV1 の depacketizer が並べ替えを吸収するために持つ packet 数。SFU は隣接
+// する 2 つを入れ替えて届けることがあり、順番どおりにしか読めない
+// depacketizer はそれを欠落と見なして次のキーフレームまで捨ててしまう。
+// 順番どおりに届いている限り 1 つも保持しないので、遅延は増えない。
+// CONFIG_RECV_BUFFER_SIZE x この数だけ BSS を使う
+#ifndef CONFIG_AV1_REORDER_DEPTH
+#define CONFIG_AV1_REORDER_DEPTH 4
 #endif
 
 #define CONFIG_IPV6 0

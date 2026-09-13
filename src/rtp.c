@@ -512,6 +512,301 @@ static int rtp_decode_h264(RtpDecoder* rtp_decoder, uint8_t* buf, size_t size) {
   return 0;
 }
 
+/* ──────────────────────────────────────────────────────────────────────────
+ *  AV1 depacketization — the inverse of rtp_encoder_encode_av1.
+ *
+ *  The sender strips the temporal delimiter and clears obu_has_size_field,
+ *  so both are restored here and the decoder gets back the same low-overhead
+ *  bitstream the encoder was handed.  An OBU element may span packets (Z/Y),
+ *  so the OBU being reassembled is accumulated in place at the tail of the
+ *  temporal unit and only gets its size field spliced in once its last
+ *  fragment arrives.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+#define AV1_AGGR_Z(h) (((h) >> 7) & 0x01)
+#define AV1_AGGR_Y(h) (((h) >> 6) & 0x01)
+#define AV1_AGGR_W(h) (((h) >> 4) & 0x03)
+#define AV1_AGGR_N(h) (((h) >> 3) & 0x01)
+
+// obu_type 2, obu_has_size_field set, zero-length payload
+static const uint8_t av1_temporal_delimiter[2] = {0x12, 0x00};
+
+typedef struct Av1Depacketizer {
+  uint8_t buf[CONFIG_MAX_AV1_TU_SIZE];
+  size_t tu_len;      // completed OBUs, starting with the temporal delimiter
+  size_t obu_len;     // bytes of the OBU accumulating at buf + tu_len
+  int obu_open;       // that OBU continues into the next packet
+  uint16_t next_seq;  // sequence number the next packet has to carry
+  int have_seq;
+  int dropping;  // discarding until the next coded video sequence
+  int started;
+} Av1Depacketizer;
+
+static void av1_depay_reset(Av1Depacketizer* depay) {
+  memcpy(depay->buf, av1_temporal_delimiter, sizeof(av1_temporal_delimiter));
+  depay->tu_len = sizeof(av1_temporal_delimiter);
+  depay->obu_len = 0;
+  depay->obu_open = 0;
+}
+
+// splice obu_size back into the OBU sitting at buf + tu_len and take it into
+// the temporal unit. The payload has to slide over to make room for the field.
+static int av1_depay_close_obu(Av1Depacketizer* depay) {
+  uint8_t* obu = depay->buf + depay->tu_len;
+  size_t hdr_size, payload_size, len_size;
+
+  if (depay->obu_len == 0) {
+    return 0;
+  }
+
+  hdr_size = 1 + (OBU_HDR_HAS_EXTENSION(obu[0]) ? 1 : 0);
+  if (depay->obu_len < hdr_size) {
+    LOGE("AV1: OBU shorter than its header");
+    return -1;
+  }
+
+  // the payload format says to strip obu_size, but a sender is allowed to
+  // leave it in. then the OBU is already in the low-overhead form, and
+  // splicing a second length field in would desynchronise the whole unit
+  if (OBU_HDR_HAS_SIZE_FIELD(obu[0])) {
+    depay->tu_len += depay->obu_len;
+    depay->obu_len = 0;
+    return 0;
+  }
+
+  payload_size = depay->obu_len - hdr_size;
+  len_size = av1_leb128_size(payload_size);
+  if (depay->tu_len + depay->obu_len + len_size > sizeof(depay->buf)) {
+    LOGE("AV1: no room to restore obu_size");
+    return -1;
+  }
+
+  memmove(obu + hdr_size + len_size, obu + hdr_size, payload_size);
+  av1_leb128_write(obu + hdr_size, payload_size);
+  obu[0] |= 0x02;  // obu_has_size_field
+
+  depay->tu_len += hdr_size + len_size + payload_size;
+  depay->obu_len = 0;
+  return 0;
+}
+
+static int av1_depay_packet(RtpDecoder* rtp_decoder, uint8_t* buf, size_t size) {
+  static Av1Depacketizer depay;  // one video track, same as rtp_decode_h264
+  RtpPacket* rtp_packet = (RtpPacket*)buf;
+  const uint8_t* payload;
+  size_t hdr_size, payload_size, pos = 0;
+  uint8_t aggr;
+  int w, element = 0;
+
+  if (!depay.started) {
+    av1_depay_reset(&depay);
+    depay.started = 1;
+    depay.dropping = 1;  // joining mid-stream: wait for a sequence header
+  }
+
+  // csrc and the extension are never negotiated by sdp_append_av1, but an
+  // SFU in the path may still add them, and guessing wrong shifts the whole
+  // aggregation header by four bytes
+  hdr_size = sizeof(RtpHeader) + rtp_packet->header.csrccount * 4;
+  if (rtp_packet->header.extension) {
+    if (size < hdr_size + 4) {
+      return -1;
+    }
+    hdr_size += 4 + (((size_t)buf[hdr_size + 2] << 8) | buf[hdr_size + 3]) * 4;
+  }
+  if (size < hdr_size) {
+    return -1;
+  }
+
+  // an SFU probes the downlink with padding-only packets. the trailing byte
+  // counts the padding, and reading it as AV1 turns a healthy stream into a
+  // stream of parse errors
+  if (rtp_packet->header.padding) {
+    size_t padding = size > 0 ? buf[size - 1] : 0;
+    if (padding == 0 || padding > size - hdr_size) {
+      return -1;
+    }
+    size -= padding;
+  }
+
+  // the sequence has to keep advancing across packets that carry no OBUs,
+  // otherwise the next real packet looks like a gap
+  if (depay.have_seq && ntohs(rtp_packet->header.seq_number) != depay.next_seq) {
+    // 欠落と並べ替えを見分けられるように、実際の seq を出す。delta が正なら
+    // 取りこぼし、負なら遅れて届いた packet(並べ替え)
+    LOGW("AV1: sequence gap, dropping until the next coded video sequence (got=%u expected=%u delta=%d mark=%d ts=%u)",
+         (unsigned)ntohs(rtp_packet->header.seq_number), (unsigned)depay.next_seq,
+         (int)(int16_t)(ntohs(rtp_packet->header.seq_number) - depay.next_seq),
+         (int)rtp_packet->header.markerbit, (unsigned)ntohl(rtp_packet->header.timestamp));
+    av1_depay_reset(&depay);
+    depay.dropping = 1;
+  }
+  depay.have_seq = 1;
+  depay.next_seq = ntohs(rtp_packet->header.seq_number) + 1;
+
+  // a probe packet is all padding: it advances the sequence and nothing else
+  if (size <= hdr_size + AV1_AGGR_HEADER_SIZE) {
+    return (int)size;
+  }
+
+  payload = buf + hdr_size;
+  payload_size = size - hdr_size - AV1_AGGR_HEADER_SIZE;
+  aggr = payload[0];
+  payload += AV1_AGGR_HEADER_SIZE;
+  w = AV1_AGGR_W(aggr);
+
+  if (depay.dropping) {
+    if (!AV1_AGGR_N(aggr)) {
+      return (int)size;
+    }
+    depay.dropping = 0;
+    av1_depay_reset(&depay);
+  }
+
+  // Z has to agree with the OBU the previous packet left open
+  if (AV1_AGGR_Z(aggr) != depay.obu_open) {
+    LOGW("AV1: fragment continuation mismatch");
+    av1_depay_reset(&depay);
+    depay.dropping = 1;
+    return (int)size;
+  }
+  depay.obu_open = 0;
+
+  while (pos < payload_size) {
+    size_t len, len_bytes = 0;
+
+    // with W set, only the first W-1 elements carry a length; the last one
+    // runs to the end of the payload
+    if (w != 0 && ++element == w) {
+      len = payload_size - pos;
+    } else if (av1_leb128_read(payload + pos, payload_size - pos, &len, &len_bytes) != 0) {
+      LOGE("AV1: malformed element length");
+      goto corrupt;
+    }
+
+    pos += len_bytes;
+    if (len > payload_size - pos) {
+      LOGE("AV1: element overruns the packet");
+      goto corrupt;
+    }
+    if (depay.tu_len + depay.obu_len + len > sizeof(depay.buf)) {
+      LOGE("AV1: temporal unit exceeds %d bytes", (int)sizeof(depay.buf));
+      goto corrupt;
+    }
+
+    memcpy(depay.buf + depay.tu_len + depay.obu_len, payload + pos, len);
+    depay.obu_len += len;
+    pos += len;
+
+    // every element is complete except a trailing one that Y continues
+    if (pos < payload_size || !AV1_AGGR_Y(aggr)) {
+      if (av1_depay_close_obu(&depay) != 0) {
+        goto corrupt;
+      }
+    } else {
+      depay.obu_open = 1;
+    }
+  }
+
+  if (rtp_packet->header.markerbit) {
+    if (depay.obu_open) {
+      LOGE("AV1: temporal unit ended mid-OBU");
+      goto corrupt;
+    }
+    if (depay.tu_len > sizeof(av1_temporal_delimiter) && rtp_decoder->on_packet != NULL) {
+      rtp_decoder->on_packet(depay.buf, depay.tu_len, rtp_decoder->user_data);
+    }
+    av1_depay_reset(&depay);
+  }
+
+  return (int)size;
+
+corrupt:
+  av1_depay_reset(&depay);
+  depay.dropping = 1;
+  return -1;
+}
+
+/* ────────────────────────────────────────────────────────────────────────────
+ *  seq の穴を少しだけ待つ。
+ *
+ *  av1_depay_packet は届いた順にしか読めず、seq が飛ぶと次の coded video
+ *  sequence まで捨てる。SFU が隣接する 2 packet を入れ替えて届けるだけで
+ *  キーフレーム 1 周期ぶんの映像が失われるので、その手前で順番に戻す。
+ *
+ *  expect が埋まるまで後続を預かるだけで、順番どおりに届いている packet は
+ *  その場で流す。穴が CONFIG_AV1_REORDER_DEPTH 個先まで埋まらなければ本物の
+ *  欠落とみなし、預かっている分を順に出してから追いつく。
+ * ────────────────────────────────────────────────────────────────────────── */
+typedef struct Av1Reorder {
+  uint8_t buf[CONFIG_AV1_REORDER_DEPTH][CONFIG_RECV_BUFFER_SIZE];
+  size_t len[CONFIG_AV1_REORDER_DEPTH];  // 0 なら空き
+  uint16_t expect;
+  int started;
+} Av1Reorder;
+
+static void av1_reorder_release(Av1Reorder* reorder, RtpDecoder* rtp_decoder, size_t slot) {
+  size_t len = reorder->len[slot];
+  reorder->len[slot] = 0;
+  av1_depay_packet(rtp_decoder, reorder->buf[slot], len);
+}
+
+// expect から続いている分だけ出す
+static void av1_reorder_drain(Av1Reorder* reorder, RtpDecoder* rtp_decoder) {
+  while (reorder->len[reorder->expect % CONFIG_AV1_REORDER_DEPTH] != 0) {
+    av1_reorder_release(reorder, rtp_decoder, reorder->expect % CONFIG_AV1_REORDER_DEPTH);
+    reorder->expect++;
+  }
+}
+
+// 穴は諦めて、預かっている分を seq の順に出す
+static void av1_reorder_flush(Av1Reorder* reorder, RtpDecoder* rtp_decoder) {
+  int i;
+  for (i = 0; i < CONFIG_AV1_REORDER_DEPTH; i++) {
+    size_t slot = (size_t)((uint16_t)(reorder->expect + i) % CONFIG_AV1_REORDER_DEPTH);
+    if (reorder->len[slot] != 0) {
+      av1_reorder_release(reorder, rtp_decoder, slot);
+    }
+  }
+}
+
+static int rtp_decode_av1(RtpDecoder* rtp_decoder, uint8_t* buf, size_t size) {
+  static Av1Reorder reorder;  // av1_depay_packet と同じく video track は 1 本
+  RtpPacket* rtp_packet = (RtpPacket*)buf;
+  uint16_t seq;
+  int16_t ahead;
+  size_t slot;
+
+  if (size < sizeof(RtpHeader) || size > CONFIG_RECV_BUFFER_SIZE) {
+    return -1;
+  }
+
+  seq = ntohs(rtp_packet->header.seq_number);
+  if (!reorder.started) {
+    reorder.started = 1;
+    reorder.expect = seq;
+  }
+
+  ahead = (int16_t)(seq - reorder.expect);
+  if (ahead < 0) {
+    // 待つのをやめた後に届いた。今さら渡すと depacketizer 側で seq が
+    // 巻き戻り、本物の欠落と区別がつかなくなる
+    LOGD("AV1: packet %u arrived after the window moved on, dropping", (unsigned)seq);
+    return (int)size;
+  }
+  if (ahead >= CONFIG_AV1_REORDER_DEPTH) {
+    av1_reorder_flush(&reorder, rtp_decoder);
+    reorder.expect = seq;
+  }
+
+  slot = seq % CONFIG_AV1_REORDER_DEPTH;
+  memcpy(reorder.buf[slot], buf, size);
+  reorder.len[slot] = size;
+  av1_reorder_drain(&reorder, rtp_decoder);
+
+  return (int)size;
+}
+
 static int rtp_decode_generic(RtpDecoder* rtp_decoder, uint8_t* buf, size_t size) {
   RtpPacket* rtp_packet = (RtpPacket*)buf;
   if (rtp_decoder->on_packet != NULL)
@@ -529,7 +824,7 @@ void rtp_decoder_init(RtpDecoder* rtp_decoder, MediaCodec codec, RtpOnPacket on_
       rtp_decoder->decode_func = rtp_decode_h264;
       break;
     case CODEC_AV1:
-      rtp_decoder->decode_func = NULL;  // send only for now
+      rtp_decoder->decode_func = rtp_decode_av1;
       break;
     case CODEC_PCMA:
     case CODEC_PCMU:
