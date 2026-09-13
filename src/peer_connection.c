@@ -33,8 +33,8 @@ struct PeerConnection {
   void (*on_connected)(void* userdata);
   void (*on_receiver_packet_loss)(float fraction_loss, uint32_t total_loss, void* user_data);
 
-  uint8_t temp_buf[CONFIG_MTU];
-  uint8_t agent_buf[CONFIG_MTU];
+  uint8_t temp_buf[CONFIG_RECV_BUFFER_SIZE];
+  uint8_t agent_buf[CONFIG_RECV_BUFFER_SIZE];
   int agent_ret;
   int b_local_description_created;
 
@@ -45,6 +45,8 @@ struct PeerConnection {
 
   uint32_t remote_assrc;
   uint32_t remote_vssrc;
+
+  uint64_t consent_request_time;
 };
 
 static void peer_connection_outgoing_rtp_packet(uint8_t* data, size_t size, void* user_data) {
@@ -324,6 +326,14 @@ int peer_connection_loop(PeerConnection* pc) {
       }
       break;
     case PEER_CONNECTION_COMPLETED:
+      // Nothing else here talks to the peer, and a receive-only connection
+      // sends no RTP at all. Stop these and the remote end stops sending.
+      if (CONFIG_CONSENT_INTERVAL > 0 &&
+          (ports_get_epoch_time() - pc->consent_request_time) > CONFIG_CONSENT_INTERVAL) {
+        pc->consent_request_time = ports_get_epoch_time();
+        agent_send_consent_request(&pc->agent);
+      }
+
       if ((pc->agent_ret = agent_recv(&pc->agent, pc->agent_buf, sizeof(pc->agent_buf))) > 0) {
         LOGD("agent_recv %d", pc->agent_ret);
         // Update keepalive timestamp on any valid data received
@@ -345,13 +355,15 @@ int peer_connection_loop(PeerConnection* pc) {
         } else if (rtp_packet_validate(pc->agent_buf, pc->agent_ret)) {
           LOGD("Got RTP packet");
 
-          dtls_srtp_decrypt_rtp_packet(&pc->dtls_srtp, pc->agent_buf, &pc->agent_ret);
-
-          ssrc = rtp_get_ssrc(pc->agent_buf);
-          if (ssrc == pc->remote_assrc) {
-            rtp_decoder_decode(&pc->artp_decoder, pc->agent_buf, pc->agent_ret);
-          } else if (ssrc == pc->remote_vssrc) {
-            rtp_decoder_decode(&pc->vrtp_decoder, pc->agent_buf, pc->agent_ret);
+          // 復号できなかった packet は暗号文のまま残る。depacketizer に渡すと
+          // 暗号文を payload format として読むことになるので、ここで捨てる
+          if (dtls_srtp_decrypt_rtp_packet(&pc->dtls_srtp, pc->agent_buf, &pc->agent_ret) == 0) {
+            ssrc = rtp_get_ssrc(pc->agent_buf);
+            if (ssrc == pc->remote_assrc) {
+              rtp_decoder_decode(&pc->artp_decoder, pc->agent_buf, pc->agent_ret);
+            } else if (ssrc == pc->remote_vssrc) {
+              rtp_decoder_decode(&pc->vrtp_decoder, pc->agent_buf, pc->agent_ret);
+            }
           }
 
         } else {

@@ -89,7 +89,9 @@ void dtls_srtp_sctp_to_dtls(DtlsSrtp* dtls_srtp, uint8_t* packet, int bytes);
 
 int dtls_srtp_probe(uint8_t* buf);
 
-void dtls_srtp_decrypt_rtp_packet(DtlsSrtp* dtls_srtp, uint8_t* packet, int* bytes);
+/* 復号できたら 0、失敗したら -1。失敗した packet は暗号文のまま残るので、
+ * 呼び出し側はそれ以上先へ渡してはいけない */
+int dtls_srtp_decrypt_rtp_packet(DtlsSrtp* dtls_srtp, uint8_t* packet, int* bytes);
 
 void dtls_srtp_decrypt_rtcp_packet(DtlsSrtp* dtls_srtp, uint8_t* packet, int* bytes);
 

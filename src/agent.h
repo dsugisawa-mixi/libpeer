@@ -88,6 +88,11 @@ int agent_select_candidate_pair(Agent* agent);
 
 int agent_connectivity_check(Agent* agent);
 
+/* Send one RFC 7675 consent check to the nominated pair. Unlike
+ * agent_connectivity_check, this is meant for an already established
+ * connection: it only sends, and leaves the candidate pair state alone. */
+int agent_send_consent_request(Agent* agent);
+
 void agent_clear_candidates(Agent* agent);
 
 int agent_create(Agent* agent);

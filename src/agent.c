@@ -341,6 +341,24 @@ static void agent_create_binding_request(Agent* agent, StunMessage* msg) {
   stun_msg_finish(msg, STUN_CREDENTIAL_SHORT_TERM, agent->remote_upwd, strlen(agent->remote_upwd));
 }
 
+/* RFC 7675 consent freshness. Once ICE has settled, agent_connectivity_check
+ * refuses to run -- it wants the nominated pair still INPROGRESS, and it
+ * consumes a datagram of its own -- so an established connection has nothing
+ * left that talks to the peer. A sender gets away with that because its RTP
+ * keeps the path warm. A receive-only peer goes completely silent, and the
+ * remote end eventually stops sending to it. */
+int agent_send_consent_request(Agent* agent) {
+  StunMessage msg;
+
+  if (agent->nominated_pair == NULL) {
+    return -1;
+  }
+
+  memset(&msg, 0, sizeof(msg));
+  agent_create_binding_request(agent, &msg);
+  return agent_socket_send(agent, &agent->nominated_pair->remote->addr, msg.buf, msg.size);
+}
+
 void agent_process_stun_request(Agent* agent, StunMessage* stun_msg, Address* addr) {
   StunMessage msg;
   StunHeader* header;
@@ -364,6 +382,10 @@ void agent_process_stun_response(Agent* agent, StunMessage* stun_msg) {
     case STUN_METHOD_BINDING:
       if (stun_msg_is_valid(stun_msg->buf, stun_msg->size, agent->remote_upwd) == 0) {
         agent->nominated_pair->state = ICE_CANDIDATE_STATE_SUCCEEDED;
+        // an answered consent check is what says the path is alive. a
+        // receive-only peer sends no RTP, and agent_recv reports STUN as 0
+        // bytes, so without this the keepalive would only ever see media
+        agent->binding_request_time = ports_get_epoch_time();
       }
       break;
     default:
