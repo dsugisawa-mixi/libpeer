@@ -59,6 +59,22 @@ static inline void rtp_header_set_marker(RtpHeader* header) {
   header->mpt |= 0x80U;
 }
 
+static inline int rtp_header_marker(const RtpHeader* header) {
+  return (header->mpt & 0x80U) != 0;
+}
+
+static inline uint8_t rtp_header_csrc_count(const RtpHeader* header) {
+  return header->vpxcc & 0x0fU;
+}
+
+static inline int rtp_header_has_extension(const RtpHeader* header) {
+  return (header->vpxcc & 0x10U) != 0;
+}
+
+static inline int rtp_header_has_padding(const RtpHeader* header) {
+  return (header->vpxcc & 0x20U) != 0;
+}
+
 typedef struct RtpPacket {
   RtpHeader header;
   uint8_t payload[0];

@@ -51,7 +51,7 @@ typedef enum MediaCodec {
   CODEC_H264,
   CODEC_VP8,    // not implemented yet
   CODEC_MJPEG,  // not implemented yet
-  CODEC_AV1,    // send only (RTP payload format for AV1 v1.0.0)
+  CODEC_AV1,    // RTP payload format for AV1 v1.0.0
 
   /* Audio */
   CODEC_OPUS,  // not implemented yet

@@ -78,12 +78,28 @@
 #define CONFIG_MAX_NALU_SIZE (100 * 1024)  // 100KB
 #endif
 
+// One reassembled AV1 temporal unit. A keyframe is far bigger than a NALU,
+// so this gets its own budget; shrink it on targets where the BSS matters.
+#ifndef CONFIG_MAX_AV1_TU_SIZE
+#define CONFIG_MAX_AV1_TU_SIZE (256 * 1024)  // 256KB
+#endif
+
 // CONFIG_MTU bounds what we send. What we receive is bounded by the peer, and
 // an SFU happily sends larger datagrams. recvfrom truncates silently, so a
 // receive buffer sized to CONFIG_MTU loses the tail of every full-size packet
 // -- including the SRTP auth tag, which turns into srtp_err_status_auth_fail.
 #ifndef CONFIG_RECV_BUFFER_SIZE
 #define CONFIG_RECV_BUFFER_SIZE 2048
+#endif
+
+// How many packets the AV1 depacketizer holds back to absorb reordering. An
+// SFU may deliver two adjacent packets swapped, and a depacketizer that can
+// only read them in order takes that for a loss and discards everything until
+// the next keyframe. Nothing is held while packets arrive in order, so this
+// costs no latency in the normal case.
+// Uses CONFIG_RECV_BUFFER_SIZE x this many bytes of BSS.
+#ifndef CONFIG_AV1_REORDER_DEPTH
+#define CONFIG_AV1_REORDER_DEPTH 4
 #endif
 
 #define CONFIG_IPV6 0
