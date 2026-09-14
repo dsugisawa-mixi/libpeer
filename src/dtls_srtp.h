@@ -76,6 +76,12 @@ typedef struct DtlsSrtp {
 
   Address* remote_addr;
 
+  /* peer_connection_loop がソケットから取り出した datagram を 1 個だけ預かる。
+   * BIO はまずここを読む。これが無いと mbedtls はソケットを自分で読みに行き、
+   * 目当ての record は既に消費済みなので、代わりに届いた SRTP を食い続ける */
+  const uint8_t* incoming;
+  size_t incoming_len;
+
   DtlsSrtpRole role;
   DtlsSrtpState state;
   int initialized;
@@ -98,6 +104,10 @@ int dtls_srtp_handshake(DtlsSrtp* dtls_srtp, Address* addr, const char* remote_f
 int dtls_srtp_write(DtlsSrtp* dtls_srtp, const uint8_t* buf, size_t len);
 
 int dtls_srtp_read(DtlsSrtp* dtls_srtp, uint8_t* buf, size_t len);
+
+/* 受信済みの datagram を次の dtls_srtp_read に渡す。buf は read が返るまで
+ * 生きていること。コピーはしない */
+void dtls_srtp_incoming_data(DtlsSrtp* dtls_srtp, const uint8_t* buf, size_t len);
 
 void dtls_srtp_sctp_to_dtls(DtlsSrtp* dtls_srtp, uint8_t* packet, int bytes);
 

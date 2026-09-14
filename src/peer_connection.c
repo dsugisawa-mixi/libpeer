@@ -335,7 +335,12 @@ int peer_connection_loop(PeerConnection* pc) {
           peer_connection_incoming_rtcp(pc, pc->agent_buf, pc->agent_ret);
 
         } else if (dtls_srtp_probe(pc->agent_buf)) {
-          int ret = dtls_srtp_read(&pc->dtls_srtp, pc->temp_buf, sizeof(pc->temp_buf));
+          // この datagram は agent_recv が既にソケットから取り出している。
+          // 渡さないと mbedtls は自分で読みに行き、そこに居るのは次に届いた
+          // SRTP なので、DTLS は永久に record を待ち、映像も止まる
+          int ret;
+          dtls_srtp_incoming_data(&pc->dtls_srtp, pc->agent_buf, pc->agent_ret);
+          ret = dtls_srtp_read(&pc->dtls_srtp, pc->temp_buf, sizeof(pc->temp_buf));
           LOGD("Got DTLS data %d", ret);
 
           if (ret > 0) {

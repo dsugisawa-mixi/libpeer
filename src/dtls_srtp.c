@@ -28,11 +28,34 @@ int dtls_srtp_udp_send(void* ctx, const uint8_t* buf, size_t len) {
   return ret;
 }
 
+void dtls_srtp_incoming_data(DtlsSrtp* dtls_srtp, const uint8_t* buf, size_t len) {
+  dtls_srtp->incoming = buf;
+  dtls_srtp->incoming_len = len;
+}
+
 int dtls_srtp_udp_recv(void* ctx, uint8_t* buf, size_t len) {
   DtlsSrtp* dtls_srtp = (DtlsSrtp*)ctx;
   UdpSocket* udp_socket = (UdpSocket*)dtls_srtp->user_data;
 
   int ret;
+
+  /* 呼び出し側が既にソケットから取り出した datagram があれば、それを渡す */
+  if (dtls_srtp->incoming_len > 0) {
+    ret = (int)(dtls_srtp->incoming_len < len ? dtls_srtp->incoming_len : len);
+    memcpy(buf, dtls_srtp->incoming, ret);
+    dtls_srtp->incoming = NULL;
+    dtls_srtp->incoming_len = 0;
+    return ret;
+  }
+
+  /* 確立後にソケットを直接読むと、peer_connection_loop と同じ fd を取り合う
+   * ことになる。掴めるのはたいてい SRTP のメディアで、DTLS record としては
+   * 不正だから mbedtls は捨ててもう一度読む。その間ずっと映像が消えるので、
+   * ここでは待たずに戻り、次の datagram は loop から渡してもらう。
+   * handshake 中は loop が受信していないので、従来どおり自分で読む */
+  if (dtls_srtp->state == DTLS_SRTP_STATE_CONNECTED) {
+    return MBEDTLS_ERR_SSL_WANT_READ;
+  }
 
   while ((ret = udp_socket_recvfrom(udp_socket, &udp_socket->bind_addr, buf, len)) <= 0) {
     ports_sleep_ms(1);
@@ -728,10 +751,13 @@ int dtls_srtp_read(DtlsSrtp* dtls_srtp, unsigned char* buf, size_t len) {
 
   memset(buf, 0, len);
 
+  /* 預かった datagram を使い切ったら戻る。使い切ってなお足りないと言われる
+   * 間だけ回す (1 つの datagram に record が複数入っていることがある) */
   do {
     ret = mbedtls_ssl_read(&dtls_srtp->ssl, buf, len);
 
-  } while (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE);
+  } while ((ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE) &&
+           dtls_srtp->incoming_len > 0);
 
   return ret;
 }
